@@ -425,6 +425,7 @@ async def agent_check_availability(body: CheckAvailabilityRequest):
     Returns {available: bool, message: str, conflict_details?: {...}}
     """
     try:
+        uid = int(body.user_id)
         appt_date = body.appointment_date
         start = body.start_time
         end = body.end_time
@@ -447,7 +448,7 @@ async def agent_check_availability(body: CheckAvailabilityRequest):
                     ORDER BY start_time
                     LIMIT 1
                     """,
-                    (body.user_id, appt_date, end, start),
+                    (uid, appt_date, end, start),
                 )
                 row = cursor.fetchone()
         finally:
@@ -490,7 +491,7 @@ class SendConfirmationRequest(BaseModel):
     appointment_date: str
     start_time: str
     attendee_name: str
-    organizer_email: str
+    organizer_email: str | None = None
     notes: str | None = None
 
 
@@ -940,7 +941,7 @@ async def book_appointment(request: Request):
         data = await request.json()
         
         user_id = data.get("user_id")
-        appointment_date = data.get("appointment_date") 
+        appointment_date = data.get("appointment_date")
         start_time = data.get("start_time")
         end_time = data.get("end_time")
         attendee_name = data.get("attendee_name", "Valued Customer")
@@ -948,16 +949,28 @@ async def book_appointment(request: Request):
         description = data.get("description", "")
         organizer_name = data.get("organizer_name")
         organizer_email = data.get("organizer_email")
-        
-        if not all([user_id, appointment_date, start_time, end_time, organizer_name]):
+
+        try:
+            user_id = int(user_id)
+        except (TypeError, ValueError):
+            return error_response("Invalid or missing user_id", status_code=400)
+
+        if not all([appointment_date, start_time, organizer_name]):
             return error_response("Missing required fields", status_code=400)
+
+        if not end_time:
+            try:
+                st = datetime.strptime(start_time, "%H:%M")
+                end_time = (st + timedelta(hours=1)).strftime("%H:%M")
+            except ValueError:
+                return error_response("Invalid start_time; use HH:MM", status_code=400)
 
         # If caller didn't provide email, fall back to the business user's email.
         # This prevents production failures (appointments.attendee_email is NOT NULL).
         attendee_email = organizer_email
         if not attendee_email:
             try:
-                u = db.get_user_by_id(int(user_id))
+                u = db.get_user_by_id(user_id)
                 attendee_email = (u.get("email") if isinstance(u, dict) else None) or "no-reply@example.com"
             except Exception:
                 attendee_email = "no-reply@example.com"
@@ -995,7 +1008,7 @@ async def book_appointment(request: Request):
         
         return JSONResponse({
             "success": True,
-            "appointment_id": appointment_id,
+            "appointment_id": str(appointment_id),
             "email_sent": email_sent,
             "message": "Appointment booked successfully" + ("" if organizer_email else " (no email provided)")
         })
@@ -1092,7 +1105,7 @@ async def receive_agent_event(request: Request):
                     if row and not row[0]:
                         updates["started_at"] = now
             finally:
-                conn.close()
+                db.release_connection(conn)
         
         # ✅ Handle terminal states
         if status in {"unanswered", "completed", "failed", "no_availability", "callback_requested"}:
