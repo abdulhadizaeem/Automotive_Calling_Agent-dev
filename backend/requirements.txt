@@ -22,3 +22,4 @@ livekit.plugins.turn_detector
 pytz
 google-cloud-storage
 psycopg2
+retell-sdk

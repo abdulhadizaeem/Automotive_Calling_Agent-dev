@@ -37,6 +37,7 @@ class PGDB:
         self.create_call_history_table()
         self.create_appointments_table()
         self.create_user_prompts_table()
+        self.create_retell_webhook_dedupe_table()
 
     def get_connection(self):
         """Get connection from pool"""
@@ -175,6 +176,32 @@ class PGDB:
             logging.info("✅ user_prompts table created")
         except Exception as e:
             logging.error(f"Error creating user_prompts table: {e}")
+            conn.rollback()
+        finally:
+            self.release_connection(conn)
+
+    def create_retell_webhook_dedupe_table(self):
+        """Idempotency for Retell POST /retell-webhook deliveries."""
+        conn = self.get_connection()
+        try:
+            with conn.cursor() as cursor:
+                cursor.execute("""
+                    CREATE TABLE IF NOT EXISTS retell_webhook_dedupe (
+                        id SERIAL PRIMARY KEY,
+                        call_id TEXT NOT NULL,
+                        dedupe_key TEXT NOT NULL,
+                        event TEXT,
+                        created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
+                        UNIQUE(call_id, dedupe_key)
+                    );
+                """)
+                cursor.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_retell_dedupe_call_id ON retell_webhook_dedupe (call_id);"
+                )
+            conn.commit()
+            logging.info("✅ retell_webhook_dedupe table ready")
+        except Exception as e:
+            logging.error(f"Error creating retell_webhook_dedupe: {e}")
             conn.rollback()
         finally:
             self.release_connection(conn)
@@ -667,7 +694,8 @@ Tone: Professional and friendly"""
         status: str = None,
         voice_id: str = None,
         voice_name: str = None,
-        to_number: str = None
+        to_number: str = None,
+        from_number: str = None,
     ):
         """
         Insert a new call history record with initial data.
@@ -678,15 +706,15 @@ Tone: Professional and friendly"""
             with conn.cursor() as cursor:
                 values = (
                     user_id, call_id, status,
-                    voice_id, voice_name, to_number
+                    voice_id, voice_name, to_number, from_number
                 )
 
                 cursor.execute("""
                     INSERT INTO call_history (
                         user_id, call_id, status,
-                        voice_id, voice_name, to_number
+                        voice_id, voice_name, to_number, from_number
                     )
-                    VALUES (%s,%s,%s,%s,%s,%s)
+                    VALUES (%s,%s,%s,%s,%s,%s,%s)
                     RETURNING id;
                 """, values)
 
@@ -765,7 +793,6 @@ Tone: Professional and friendly"""
         conn = self.get_connection()
         try:
             with conn.cursor(cursor_factory=RealDictCursor) as cursor:
-                # Count total records
                 cursor.execute("SELECT COUNT(*) FROM call_history WHERE user_id = %s", (user_id,))
                 total = cursor.fetchone()["count"]
 
@@ -943,6 +970,90 @@ Tone: Professional and friendly"""
             logging.error(f"Error adding agent event: {e}")
             traceback.print_exc()
             raise
+        finally:
+            self.release_connection(conn)
+
+    def call_exists(self, call_id: str) -> bool:
+        conn = self.get_connection()
+        try:
+            with conn.cursor() as cursor:
+                cursor.execute(
+                    "SELECT 1 FROM call_history WHERE call_id = %s LIMIT 1",
+                    (call_id,),
+                )
+                return cursor.fetchone() is not None
+        finally:
+            self.release_connection(conn)
+
+    def append_events_log_entry(self, call_id: str, event_type: str, event_data: dict = None):
+        """Append to events_log without deduplication (for streaming Retell events)."""
+        conn = self.get_connection()
+        try:
+            with conn.cursor() as cursor:
+                cursor.execute(
+                    "SELECT events_log FROM call_history WHERE call_id = %s",
+                    (call_id,),
+                )
+                row = cursor.fetchone()
+                if not row:
+                    logging.warning(f"append_events_log_entry: call {call_id} not found")
+                    return
+                events_log = row[0] or []
+                if isinstance(events_log, str):
+                    try:
+                        events_log = json.loads(events_log)
+                    except Exception:
+                        events_log = []
+                events_log.append(
+                    {
+                        "event": event_type,
+                        "timestamp": datetime.now(timezone.utc).isoformat(),
+                        "data": event_data or {},
+                    }
+                )
+                cursor.execute(
+                    "UPDATE call_history SET events_log = %s WHERE call_id = %s",
+                    (json.dumps(events_log), call_id),
+                )
+            conn.commit()
+        except Exception as e:
+            conn.rollback()
+            logging.error(f"append_events_log_entry error: {e}")
+        finally:
+            self.release_connection(conn)
+
+    def retell_webhook_event_seen(self, call_id: str, dedupe_key: str) -> bool:
+        conn = self.get_connection()
+        try:
+            with conn.cursor() as cursor:
+                cursor.execute(
+                    """
+                    SELECT 1 FROM retell_webhook_dedupe
+                    WHERE call_id = %s AND dedupe_key = %s
+                    LIMIT 1
+                    """,
+                    (call_id, dedupe_key),
+                )
+                return cursor.fetchone() is not None
+        finally:
+            self.release_connection(conn)
+
+    def record_retell_webhook_event(self, call_id: str, dedupe_key: str, event: str):
+        conn = self.get_connection()
+        try:
+            with conn.cursor() as cursor:
+                cursor.execute(
+                    """
+                    INSERT INTO retell_webhook_dedupe (call_id, dedupe_key, event)
+                    VALUES (%s, %s, %s)
+                    ON CONFLICT (call_id, dedupe_key) DO NOTHING
+                    """,
+                    (call_id, dedupe_key, event),
+                )
+            conn.commit()
+        except Exception as e:
+            conn.rollback()
+            logging.error(f"record_retell_webhook_event: {e}")
         finally:
             self.release_connection(conn)
 

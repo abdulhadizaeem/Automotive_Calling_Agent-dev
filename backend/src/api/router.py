@@ -36,14 +36,19 @@ from src.models.System_Prompt import SystemPromptBuilder
 from src.utils.db import PGDB 
 from src.utils.mail_management import Send_Mail
 from src.utils.jwt_utils import create_access_token
-from src.utils.utils import get_current_user,add_call_event, get_livekit_call_status,fetch_and_store_transcript,fetch_and_store_recording, calculate_duration, check_if_answered
-from livekit import api
+from src.utils.utils import get_current_user,add_call_event,fetch_and_store_transcript,fetch_and_store_recording, calculate_duration, check_if_answered
+from src.utils.retell_utils import (
+    verify_retell_signature,
+    apply_retell_webhook_event,
+    resolve_inbound_user_id,
+)
 
 load_dotenv()
 
 router = APIRouter()
 mail_obj = Send_Mail()
 db = PGDB()
+db.create_retell_webhook_dedupe_table()
 load_dotenv(override=True)
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 GCS_BUCKET_NAME = os.getenv("GOOGLE_BUCKET_NAME")
@@ -122,115 +127,136 @@ voices = {
 }
 
 @router.post("/assistant-initiate-call")
-async def make_call_with_livekit(payload: Assistant_Payload, user=Depends(get_current_user)):
+async def assistant_initiate_call(payload: Assistant_Payload, user=Depends(get_current_user)):
+    """
+    Inbound mode: does not place an outbound dial. Returns the Retell number customers call;
+    call rows are created when Retell sends webhooks (call_started / call_ended).
+    """
     try:
-        room_name = f"call-{user['id']}-{datetime.now().strftime('%Y%m%d%H%M%S')}"
-        
-        # ✅ Get voice_id from payload.voice name
-        voice_name = getattr(payload, "voice", "david").lower()  # Default to 'david'
+        voice_name = getattr(payload, "voice", "david").lower()
         voice_id = voices.get(voice_name)
-        
         if not voice_id:
-            logging.warning(f"⚠️ Unknown voice '{voice_name}', using default 'david'")
-            voice_id = voices["david"]
+            logging.warning("Unknown voice '%s', using default 'david'", voice_name)
             voice_name = "david"
-        
-        # ✅ Get language from payload (default to 'en')
+
         language = getattr(payload, "language", "en").lower()
         valid_languages = ["en", "es", "german", "italian", "french"]
         if language not in valid_languages:
-            logging.warning(f"⚠️ Unknown language '{language}', defaulting to 'en'")
+            logging.warning("Unknown language '%s', defaulting to 'en'", language)
             language = "en"
-        
-        logging.info(f"🎤 Using voice: {voice_name} (ID: {voice_id}), Language: {language}")
-        
-        # ✅ STEP 1: Get user's custom prompt from DB
+
         user_prompt_data = db.get_user_prompt(user["id"])
-        
         if not user_prompt_data:
             return error_response("User prompt not found", status_code=404)
-        
+
         base_prompt = user_prompt_data["system_prompt"]
-        
-        # ✅ STEP 2: Build complete system prompt
         prompt_builder = SystemPromptBuilder(
             base_prompt=base_prompt,
             caller_name=payload.caller_name,
             caller_email=payload.caller_email,
             call_context=payload.context,
-            language=language  
-
+            language=language,
         )
-        
         complete_system_prompt = prompt_builder.generate_complete_prompt()
-        
-        logging.info(f"📝 Built system prompt ({len(complete_system_prompt)} chars)")
-        
-        # ✅ STEP 3: Prepare metadata with complete prompt + voice + language
-        metadata = {
-            "phone_number": payload.outbound_number,
-            "call_context": payload.context,
-            "user_id": user["id"],
-            "caller_name": payload.caller_name,
-            "caller_email": payload.caller_email,
-            "system_prompt": complete_system_prompt,
-            "agent_name": "SUMA",
-            "voice_id": voice_id,        # ✅ NEW
-            "voice_name": voice_name,    # ✅ NEW
-            "language": language         # ✅ NEW
-        }
+        logging.info("Prepared system prompt (%s chars) for user %s", len(complete_system_prompt), user["id"])
 
-        # ✅ STEP 4: Create DB record
-        db.insert_call_history(
-            user_id=user["id"],
-            call_id=room_name,
-            status="initiated",
-            to_number=payload.outbound_number,
-            voice_name=voice_name,  # ✅ Store voice name
+        inbound_number = (
+            os.getenv("RETELL_INBOUND_NUMBER")
+            or os.getenv("RETELL_PUBLIC_INBOUND_NUMBER")
+            or ""
         )
-        logging.info(f"✅ Created call record: {room_name}")
 
-        add_call_event(room_name, "call_initiated", {"user_id": user["id"]})
+        return JSONResponse(
+            {
+                "success": True,
+                "direction": "inbound",
+                "call_id": None,
+                "dispatch_id": None,
+                "inbound_number": inbound_number,
+                "voice": voice_name,
+                "language": language,
+                "message": "Inbound mode: customers call your Retell number; calls are logged when webhooks fire. Configure RETELL_INBOUND_NUMBER and map users via RETELL_INBOUND_NUMBER_USER_MAP or RETELL_DEFAULT_INBOUND_USER_ID.",
+            }
+        )
 
-        # ✅ STEP 5: Dispatch agent
-        async with api.LiveKitAPI(
-            url=os.getenv("LIVEKIT_URL", "").replace("wss://", "https://"),
-            api_key=os.getenv("LIVEKIT_API_KEY"),
-            api_secret=os.getenv("LIVEKIT_API_SECRET"),
-        ) as lkapi:
-            dispatch = await lkapi.agent_dispatch.create_dispatch(
-                api.CreateAgentDispatchRequest(
-                    agent_name="outbound-caller",
-                    room=room_name,
-                    metadata=json.dumps(metadata),
-                )
-            )
-
-        logging.info(f"✅ Agent dispatched: {dispatch.id}")
-
-        return JSONResponse({
-            "success": True,
-            "call_id": room_name,
-            "dispatch_id": dispatch.id,
-            "voice": voice_name,
-            "language": language,
-            "message": "Call initiated successfully"
-        })
-        
     except Exception as e:
-        logging.error(f"Error initiating LiveKit call: {e}")
+        logging.error("assistant-initiate-call error: %s", e)
         traceback.print_exc()
-        
-        if 'room_name' in locals():
-            try:
-                db.update_call_history(
-                    call_id=room_name,
-                    updates={"status": "failed"}
-                )
-            except:
-                pass
-        
-        raise HTTPException(status_code=500, detail=f"Failed to initiate call: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Failed to prepare inbound call: {str(e)}")
+
+
+@router.post("/retell-webhook")
+async def retell_webhook(request: Request):
+    """Retell account/agent webhook: call_started, transcript_updated, call_ended, call_analyzed, transfers."""
+    raw_body = (await request.body()).decode("utf-8")
+    sig = request.headers.get("X-Retell-Signature") or request.headers.get("x-retell-signature")
+    if not verify_retell_signature(raw_body, sig):
+        return JSONResponse(status_code=401, content={"message": "Unauthorized"})
+    try:
+        data = json.loads(raw_body)
+    except json.JSONDecodeError:
+        return JSONResponse(status_code=400, content={"message": "Invalid JSON"})
+    event = data.get("event")
+    try:
+        apply_retell_webhook_event(db, event, data)
+    except Exception as e:
+        logging.error("retell-webhook handler error: %s", e)
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(e))
+    return Response(status_code=204)
+
+
+@router.post("/retell-inbound-webhook")
+async def retell_inbound_webhook(request: Request):
+    """
+    Retell inbound routing webhook (event=call_inbound).
+    Configure this URL in Retell for your inbound number.
+    """
+    raw_body = (await request.body()).decode("utf-8")
+    sig = request.headers.get("X-Retell-Signature") or request.headers.get("x-retell-signature")
+    if not verify_retell_signature(raw_body, sig):
+        return JSONResponse(status_code=401, content={"message": "Unauthorized"})
+    try:
+        data = json.loads(raw_body)
+    except json.JSONDecodeError:
+        return JSONResponse(status_code=400, content={"message": "Invalid JSON"})
+    if data.get("event") != "call_inbound":
+        return JSONResponse(status_code=200, content={})
+
+    ci = data.get("call_inbound") or {}
+    to_number = ci.get("to_number")
+    user_id = resolve_inbound_user_id(to_number)
+
+    body: dict = {"call_inbound": {}}
+    agent_id = os.getenv("RETELL_AGENT_ID")
+    if agent_id:
+        body["call_inbound"]["override_agent_id"] = agent_id
+    ver = os.getenv("RETELL_AGENT_VERSION", "").strip()
+    if ver.isdigit():
+        body["call_inbound"]["override_agent_version"] = int(ver)
+    if user_id is not None:
+        dv = {"user_id": str(user_id)}
+        # Response engine: dynamic_variables (general) + retell_llm_dynamic_variables (Retell LLM)
+        body["call_inbound"]["dynamic_variables"] = dv
+        body["call_inbound"]["retell_llm_dynamic_variables"] = dv
+    return JSONResponse(status_code=200, content=body)
+
+
+@router.get("/retell-health")
+async def retell_health():
+    """Quick prod check: API key present (does not call Retell)."""
+    ok = bool(os.getenv("RETELL_API_KEY"))
+    return JSONResponse(
+        status_code=200 if ok else 503,
+        content={
+            "retell_api_key_configured": ok,
+            "retell_agent_id_configured": bool(os.getenv("RETELL_AGENT_ID")),
+            "inbound_number_configured": bool(
+                os.getenv("RETELL_INBOUND_NUMBER") or os.getenv("RETELL_PUBLIC_INBOUND_NUMBER")
+            ),
+            "default_inbound_user_configured": bool(os.getenv("RETELL_DEFAULT_INBOUND_USER_ID")),
+        },
+    )
 
 
 @router.post("/livekit-webhook")

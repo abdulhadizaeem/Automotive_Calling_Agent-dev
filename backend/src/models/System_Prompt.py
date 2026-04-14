@@ -322,6 +322,7 @@ class SystemPromptBuilder:
         - Don't circle back to completed topics
         - Respond within 1-2 seconds to prevent pauses
         - NEVER make long pauses - always respond quickly and briefly to maintain natural flow
+        - If someone asks what time slots are available, say we are available at their convenience and ask them to propose a time.
         """
 
     def __init__(
