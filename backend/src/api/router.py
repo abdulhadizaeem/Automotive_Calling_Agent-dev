@@ -404,64 +404,59 @@ async def agent_get_current_datetime_post():
     return await agent_get_current_datetime()
 
 
-class CheckAvailabilityRequest(BaseModel):
-    user_id: int | None = None
-    appointment_date: str  # YYYY-MM-DD
-    start_time: str  # HH:MM
-    end_time: str | None = None  # HH:MM
-
-
 @router.post("/agent/check-availability")
-async def agent_check_availability(body: CheckAvailabilityRequest):
+async def agent_check_availability(request: Request):
     """
     Checks for conflicts in the appointments table.
     Returns {available: bool, message: str, conflict_details?: {...}}
+    Retell tool endpoint.
+    IMPORTANT: user_id is NOT taken from Retell/agent payload; it is always taken from env
+    RETELL_DEFAULT_INBOUND_USER_ID (single-tenant).
     """
     try:
+        data = await request.json()
+        raw_uid = data.get("user_id")
+        appt_date = data.get("appointment_date") or data.get("date")
+        start = data.get("start_time") or data.get("time")
+        end = data.get("end_time")
+
         logging.info(
             "check-availability: raw user_id=%r appointment_date=%r start_time=%r end_time=%r",
-            body.user_id,
-            getattr(body, "appointment_date", None),
-            getattr(body, "start_time", None),
-            getattr(body, "end_time", None),
+            raw_uid, appt_date, start, end,
         )
-        uid = resolve_agent_tool_user_id(body.user_id)
+
+        uid = resolve_agent_tool_user_id(None)
         if uid is None:
             logging.error(
-                "check-availability: could not resolve user_id. raw=%r env=%r",
-                body.user_id,
+                "check-availability: missing RETELL_DEFAULT_INBOUND_USER_ID. raw_user_id=%r env=%r",
+                raw_uid,
                 os.getenv("RETELL_DEFAULT_INBOUND_USER_ID"),
             )
             return JSONResponse(
-                status_code=200,
-                content={
-                    "available": True,
-                    "message": "Could not resolve business user for this call.",
-                    "warning": "missing_user_id",
-                },
+                status_code=500,
+                content={"available": True, "message": "Server not configured: missing RETELL_DEFAULT_INBOUND_USER_ID.", "warning": "missing_env_user_id"},
             )
+
+        if not appt_date or not start:
+            logging.error("check-availability: missing date/time. keys=%s", list(data.keys()))
+            return JSONResponse(status_code=200, content={"available": True, "message": "Missing date or time.", "warning": "missing_fields"})
+
         logging.info("check-availability: resolved user_id=%s", uid)
-        # Validate user exists (prevents FK / bad mapping issues downstream)
+        # Validate env user exists (single-tenant)
         try:
             if not db.get_user_by_id(uid):
-                logging.error("check-availability: user not found for user_id=%s", uid)
-                return JSONResponse(
-                    status_code=200,
-                    content={
-                        "available": True,
-                        "message": "I couldn't verify availability for this account right now.",
-                        "warning": "invalid_user_id_mapping",
-                    },
-                )
-        except Exception:
-            pass
-        appt_date = body.appointment_date
-        start = body.start_time
-        end = body.end_time
+                logging.error("check-availability: env user not found user_id=%s", uid)
+                return JSONResponse(status_code=500, content={"available": True, "message": "Server misconfigured: env user not found.", "warning": "env_user_not_found"})
+        except Exception as e:
+            logging.error("check-availability: user lookup failed: %s", e)
+            return JSONResponse(status_code=200, content={"available": True, "message": "Could not verify availability right now.", "warning": "user_lookup_failed"})
         if not end:
-            # default to 1h duration
-            start_dt = datetime.strptime(start, "%H:%M")
-            end = (start_dt + timedelta(hours=1)).strftime("%H:%M")
+            try:
+                st_raw = str(start).strip()
+                fmt = "%H:%M:%S" if len(st_raw.split(":")) == 3 else "%H:%M"
+                end = (datetime.strptime(st_raw, fmt) + timedelta(hours=1)).strftime("%H:%M")
+            except ValueError:
+                end = None
         logging.info("check-availability: query user_id=%s date=%s start=%s end=%s", uid, appt_date, start, end)
 
         row = None
@@ -480,7 +475,7 @@ async def agent_check_availability(body: CheckAvailabilityRequest):
                         ORDER BY start_time
                         LIMIT 1
                         """,
-                        (uid, appt_date, end, start),
+                        (uid, appt_date, end or start, start),
                     )
                     row = cursor.fetchone()
                 break
@@ -988,10 +983,10 @@ async def book_appointment(request: Request):
         except Exception:
             pass
 
-        # Always resolve to a valid business user id.
-        # - Prefer a valid payload user_id (if present)
-        # - Otherwise fall back to RETELL_DEFAULT_INBOUND_USER_ID
-        user_id = resolve_agent_tool_user_id(data.get("user_id"))
+        # Retell tool endpoint.
+        # IMPORTANT: user_id is NOT taken from Retell/agent payload; it is always taken from env
+        # RETELL_DEFAULT_INBOUND_USER_ID (single-tenant).
+        user_id = resolve_agent_tool_user_id(None)
         # Accept a few common alternate field names (some flows send date/time keys).
         appointment_date = data.get("appointment_date") or data.get("date") or data.get("reservation_date")
         start_time = data.get("start_time") or data.get("time") or data.get("appointment_time")
@@ -1014,11 +1009,12 @@ async def book_appointment(request: Request):
         )
 
         if user_id is None:
-            logging.error("book-appointment: could not resolve user_id. raw=%r env=%r", data.get("user_id"), os.getenv("RETELL_DEFAULT_INBOUND_USER_ID"))
-            return error_response(
-                "Could not resolve business user_id. Set RETELL_DEFAULT_INBOUND_USER_ID (users.id).",
-                status_code=400,
+            logging.error(
+                "book-appointment: missing RETELL_DEFAULT_INBOUND_USER_ID. raw_user_id=%r env=%r",
+                data.get("user_id"),
+                os.getenv("RETELL_DEFAULT_INBOUND_USER_ID"),
             )
+            return error_response("Server not configured: missing RETELL_DEFAULT_INBOUND_USER_ID.", status_code=500)
 
         missing: list[str] = []
         if not appointment_date:
@@ -1051,11 +1047,8 @@ async def book_appointment(request: Request):
         except Exception:
             u = None
         if not u:
-            logging.error("book-appointment: user not found user_id=%r env_default=%r", user_id, os.getenv("RETELL_DEFAULT_INBOUND_USER_ID"))
-            return error_response(
-                f"Invalid business user mapping (user_id={user_id}). Ensure this users.id exists, or set RETELL_DEFAULT_INBOUND_USER_ID / RETELL_INBOUND_NUMBER_USER_MAP.",
-                status_code=400,
-            )
+            logging.error("book-appointment: env user not found user_id=%r env_default=%r", user_id, os.getenv("RETELL_DEFAULT_INBOUND_USER_ID"))
+            return error_response("Server misconfigured: env user does not exist.", status_code=500)
 
         # If caller didn't provide email, fall back to the business user's email.
         # This prevents production failures (appointments.attendee_email is NOT NULL).

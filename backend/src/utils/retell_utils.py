@@ -139,9 +139,18 @@ def resolve_agent_tool_user_id(raw: Any) -> Optional[int]:
     the literal integer 0 when {{user_id}} has no real value (e.g. test calls from
     the Retell dashboard where the inbound webhook hasn't fired).
     """
-    if raw is not None and str(raw).strip() not in ("", "0", "null", "none"):
+    s = None
+    try:
+        s = str(raw).strip() if raw is not None else None
+    except Exception:
+        s = None
+    # Retell sometimes passes literal template strings like "{{user_id}}" when unset.
+    if s and ("{{" in s or "}}" in s):
+        s = ""
+
+    if s is not None and s.lower() not in ("", "0", "null", "none"):
         try:
-            v = int(raw)
+            v = int(s)
             if v > 0:
                 return v
         except (TypeError, ValueError):

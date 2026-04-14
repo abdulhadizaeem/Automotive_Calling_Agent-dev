@@ -1696,6 +1696,44 @@ Tone: Professional and friendly"""
         # should never reach
         raise last_err or RuntimeError("create_appointment failed")
 
+    def get_user_appointments(self, user_id: int, from_date: str | None = None) -> list[dict]:
+        """
+        Return scheduled appointments for a user (from a date onward).
+        Used by GET /api/agent/get-appointments/{user_id}.
+        """
+        if not from_date:
+            from_date = datetime.now(timezone.utc).date().isoformat()
+        conn = self.get_connection()
+        try:
+            with conn.cursor(cursor_factory=RealDictCursor) as cursor:
+                cursor.execute(
+                    """
+                    SELECT
+                        id,
+                        appointment_date,
+                        start_time,
+                        end_time,
+                        attendee_email,
+                        attendee_name,
+                        title,
+                        description,
+                        notes,
+                        status,
+                        created_at
+                    FROM appointments
+                    WHERE user_id = %s
+                      AND appointment_date >= %s
+                    ORDER BY appointment_date, start_time
+                    """,
+                    (user_id, from_date),
+                )
+                return cursor.fetchall() or []
+        except Exception as e:
+            logging.error(f"Error getting appointments for user_id={user_id}: {e}")
+            raise
+        finally:
+            self.release_connection(conn)
+
 
 # import os
 # from datetime import datetime
