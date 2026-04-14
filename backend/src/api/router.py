@@ -40,6 +40,7 @@ from src.utils.jwt_utils import create_access_token
 from src.utils.utils import get_current_user, calculate_duration
 from src.utils.retell_utils import (
     apply_retell_webhook_event,
+    resolve_agent_tool_user_id,
     resolve_inbound_user_id,
     retell_get_call,
 )
@@ -405,7 +406,7 @@ async def agent_get_current_datetime_post():
 
 
 class CheckAvailabilityRequest(BaseModel):
-    user_id: int
+    user_id: int | None = None
     appointment_date: str  # YYYY-MM-DD
     start_time: str  # HH:MM
     end_time: str | None = None  # HH:MM
@@ -418,7 +419,16 @@ async def agent_check_availability(body: CheckAvailabilityRequest):
     Returns {available: bool, message: str, conflict_details?: {...}}
     """
     try:
-        uid = int(body.user_id)
+        uid = resolve_agent_tool_user_id(body.user_id)
+        if uid is None:
+            return JSONResponse(
+                status_code=200,
+                content={
+                    "available": True,
+                    "message": "Could not resolve business user for this call.",
+                    "warning": "missing_user_id",
+                },
+            )
         # Validate user exists (prevents FK / bad mapping issues downstream)
         try:
             if not db.get_user_by_id(uid):
@@ -504,7 +514,7 @@ async def agent_check_availability(body: CheckAvailabilityRequest):
 
 
 class SendConfirmationRequest(BaseModel):
-    user_id: int
+    user_id: int | None = None
     appointment_id: str
     appointment_date: str
     start_time: str
@@ -953,7 +963,7 @@ async def book_appointment(request: Request):
     try:
         data = await request.json()
         
-        user_id = data.get("user_id")
+        user_id = resolve_agent_tool_user_id(data.get("user_id"))
         appointment_date = data.get("appointment_date")
         start_time = data.get("start_time")
         end_time = data.get("end_time")
@@ -963,10 +973,11 @@ async def book_appointment(request: Request):
         organizer_name = (data.get("organizer_name") or "").strip()
         organizer_email = data.get("organizer_email")
 
-        try:
-            user_id = int(user_id)
-        except (TypeError, ValueError):
-            return error_response("Invalid or missing user_id", status_code=400)
+        if user_id is None:
+            return error_response(
+                "Invalid or missing user_id. Set RETELL_DEFAULT_INBOUND_USER_ID or pass user_id in the tool payload.",
+                status_code=400,
+            )
 
         if not all([appointment_date, start_time]):
             return error_response("Missing required fields", status_code=400)

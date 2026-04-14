@@ -91,23 +91,29 @@ def _load_inbound_number_user_map() -> dict[str, int]:
         return {}
 
 
+def default_retell_user_id_from_env() -> Optional[int]:
+    """When Retell omits metadata/numbers or mapping fails, use this users.id (single-tenant)."""
+    raw = os.getenv("RETELL_DEFAULT_INBOUND_USER_ID", "").strip()
+    if not raw:
+        return None
+    try:
+        return int(raw)
+    except ValueError:
+        logger.warning("Invalid RETELL_DEFAULT_INBOUND_USER_ID: %r", raw)
+        return None
+
+
 def resolve_inbound_user_id(to_number: Optional[str]) -> Optional[int]:
     """Map Retell inbound callee number (your number) to a user_id."""
     if not to_number:
-        return None
+        return default_retell_user_id_from_env()
     m = _load_inbound_number_user_map()
     if to_number in m:
         return m[to_number]
     compact = "".join(ch for ch in to_number if ch.isdigit() or ch == "+")
     if compact != to_number and compact in m:
         return m[compact]
-    default = os.getenv("RETELL_DEFAULT_INBOUND_USER_ID", "").strip()
-    if default:
-        try:
-            return int(default)
-        except ValueError:
-            pass
-    return None
+    return default_retell_user_id_from_env()
 
 
 def resolve_user_from_call(call: dict[str, Any]) -> Optional[int]:
@@ -120,7 +126,20 @@ def resolve_user_from_call(call: dict[str, Any]) -> Optional[int]:
     uid = resolve_inbound_user_id(call.get("to_number"))
     if uid is not None:
         return uid
-    return resolve_inbound_user_id(call.get("from_number"))
+    uid = resolve_inbound_user_id(call.get("from_number"))
+    if uid is not None:
+        return uid
+    return default_retell_user_id_from_env()
+
+
+def resolve_agent_tool_user_id(raw: Any) -> Optional[int]:
+    """Prefer tool JSON user_id; if missing or invalid, use RETELL_DEFAULT_INBOUND_USER_ID."""
+    if raw is not None and str(raw).strip() != "":
+        try:
+            return int(raw)
+        except (TypeError, ValueError):
+            pass
+    return default_retell_user_id_from_env()
 
 
 def build_transcript_payload(call: dict[str, Any]) -> Optional[dict[str, Any]]:
