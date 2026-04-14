@@ -366,3 +366,23 @@ def apply_retell_webhook_event(db, event: str, payload: dict[str, Any]) -> None:
         return
 
     db.record_retell_webhook_event(call_id, dedupe, event)
+
+
+def retell_get_call(call_id: str) -> dict[str, Any]:
+    """Fetch current call state from Retell HTTP API (dashboard / live view)."""
+    import requests
+
+    api_key = (os.getenv("RETELL_API_KEY") or "").strip()
+    if not api_key:
+        raise RuntimeError("RETELL_API_KEY is not configured")
+    url = f"https://api.retellai.com/v2/get-call/{call_id}"
+    r = requests.get(
+        url,
+        headers={"Authorization": f"Bearer {api_key}"},
+        timeout=45,
+    )
+    r.raise_for_status()
+    data = r.json()
+    if not isinstance(data, dict):
+        raise RuntimeError("Unexpected Retell get-call response")
+    return data

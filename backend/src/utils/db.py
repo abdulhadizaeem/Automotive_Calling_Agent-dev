@@ -39,6 +39,10 @@ class PGDB:
         self.create_user_prompts_table()
         self.create_retell_webhook_dedupe_table()
         self.create_inbound_call_settings_table()
+        self.ensure_call_history_schema()
+        self.ensure_users_schema()
+        self.ensure_appointments_schema()
+        self.ensure_user_prompts_schema()
 
     def get_connection(self):
         """Get connection from pool"""
@@ -231,6 +235,156 @@ class PGDB:
         except Exception as e:
             logging.error(f"Error creating inbound_call_settings: {e}")
             conn.rollback()
+        finally:
+            self.release_connection(conn)
+
+    def ensure_call_history_schema(self):
+        """
+        Add columns missing from older call_history tables (Retell logs, numbers, recordings).
+        Idempotent; safe on every startup. Requires PostgreSQL 11+ (ADD COLUMN IF NOT EXISTS).
+        """
+        conn = self.get_connection()
+        try:
+            with conn.cursor() as cursor:
+                cursor.execute(
+                    "SELECT to_regclass('public.call_history') IS NOT NULL;"
+                )
+                if not cursor.fetchone()[0]:
+                    conn.commit()
+                    logging.warning("ensure_call_history_schema: call_history table not found")
+                    return
+
+                alters = [
+                    "ALTER TABLE call_history ADD COLUMN IF NOT EXISTS status TEXT;",
+                    "ALTER TABLE call_history ADD COLUMN IF NOT EXISTS duration DOUBLE PRECISION;",
+                    "ALTER TABLE call_history ADD COLUMN IF NOT EXISTS transcript JSONB;",
+                    "ALTER TABLE call_history ADD COLUMN IF NOT EXISTS summary TEXT;",
+                    "ALTER TABLE call_history ADD COLUMN IF NOT EXISTS recording_url TEXT;",
+                    "ALTER TABLE call_history ADD COLUMN IF NOT EXISTS started_at TIMESTAMPTZ;",
+                    "ALTER TABLE call_history ADD COLUMN IF NOT EXISTS ended_at TIMESTAMPTZ;",
+                    "ALTER TABLE call_history ADD COLUMN IF NOT EXISTS voice_id TEXT;",
+                    "ALTER TABLE call_history ADD COLUMN IF NOT EXISTS voice_name TEXT;",
+                    "ALTER TABLE call_history ADD COLUMN IF NOT EXISTS from_number TEXT;",
+                    "ALTER TABLE call_history ADD COLUMN IF NOT EXISTS to_number TEXT;",
+                    "ALTER TABLE call_history ADD COLUMN IF NOT EXISTS transcript_url TEXT;",
+                    "ALTER TABLE call_history ADD COLUMN IF NOT EXISTS transcript_blob TEXT;",
+                    "ALTER TABLE call_history ADD COLUMN IF NOT EXISTS recording_blob TEXT;",
+                    (
+                        "ALTER TABLE call_history ADD COLUMN IF NOT EXISTS events_log JSONB "
+                        "DEFAULT '[]'::jsonb;"
+                    ),
+                    (
+                        "ALTER TABLE call_history ADD COLUMN IF NOT EXISTS agent_events JSONB "
+                        "DEFAULT '[]'::jsonb;"
+                    ),
+                    "ALTER TABLE call_history ADD COLUMN IF NOT EXISTS recording_blob_data BYTEA;",
+                    "ALTER TABLE call_history ADD COLUMN IF NOT EXISTS recording_size INTEGER;",
+                    (
+                        "ALTER TABLE call_history ADD COLUMN IF NOT EXISTS recording_content_type "
+                        "VARCHAR(100) DEFAULT 'audio/ogg';"
+                    ),
+                ]
+                for stmt in alters:
+                    cursor.execute(stmt)
+
+                cursor.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_call_history_events_log "
+                    "ON call_history USING GIN (events_log);"
+                )
+                cursor.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_call_history_agent_events "
+                    "ON call_history USING GIN (agent_events);"
+                )
+            conn.commit()
+            logging.info("call_history schema migration applied (if needed)")
+        except Exception as e:
+            conn.rollback()
+            logging.error(f"Error migrating call_history schema: {e}")
+            traceback.print_exc()
+        finally:
+            self.release_connection(conn)
+
+    def ensure_users_schema(self):
+        """Add columns that older deployments may lack."""
+        conn = self.get_connection()
+        try:
+            with conn.cursor() as cursor:
+                cursor.execute("SELECT to_regclass('public.users') IS NOT NULL;")
+                if not cursor.fetchone()[0]:
+                    conn.commit()
+                    return
+                for stmt in (
+                    "ALTER TABLE users ADD COLUMN IF NOT EXISTS username VARCHAR(100);",
+                    "ALTER TABLE users ADD COLUMN IF NOT EXISTS first_name VARCHAR(100);",
+                    "ALTER TABLE users ADD COLUMN IF NOT EXISTS last_name VARCHAR(100);",
+                    "ALTER TABLE users ADD COLUMN IF NOT EXISTS is_admin BOOLEAN DEFAULT FALSE;",
+                    (
+                        "ALTER TABLE users ADD COLUMN IF NOT EXISTS created_at "
+                        "TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP;"
+                    ),
+                    (
+                        "ALTER TABLE users ADD COLUMN IF NOT EXISTS updated_at "
+                        "TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP;"
+                    ),
+                ):
+                    cursor.execute(stmt)
+            conn.commit()
+            logging.info("users schema migration applied (if needed)")
+        except Exception as e:
+            conn.rollback()
+            logging.error(f"Error migrating users schema: {e}")
+            traceback.print_exc()
+        finally:
+            self.release_connection(conn)
+
+    def ensure_appointments_schema(self):
+        conn = self.get_connection()
+        try:
+            with conn.cursor() as cursor:
+                cursor.execute("SELECT to_regclass('public.appointments') IS NOT NULL;")
+                if not cursor.fetchone()[0]:
+                    conn.commit()
+                    return
+                for stmt in (
+                    "ALTER TABLE appointments ADD COLUMN IF NOT EXISTS notes TEXT;",
+                    "ALTER TABLE appointments ADD COLUMN IF NOT EXISTS description TEXT;",
+                    (
+                        "ALTER TABLE appointments ADD COLUMN IF NOT EXISTS status "
+                        "VARCHAR(50) DEFAULT 'scheduled';"
+                    ),
+                    (
+                        "ALTER TABLE appointments ADD COLUMN IF NOT EXISTS created_at "
+                        "TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP;"
+                    ),
+                ):
+                    cursor.execute(stmt)
+            conn.commit()
+            logging.info("appointments schema migration applied (if needed)")
+        except Exception as e:
+            conn.rollback()
+            logging.error(f"Error migrating appointments schema: {e}")
+            traceback.print_exc()
+        finally:
+            self.release_connection(conn)
+
+    def ensure_user_prompts_schema(self):
+        conn = self.get_connection()
+        try:
+            with conn.cursor() as cursor:
+                cursor.execute("SELECT to_regclass('public.user_prompts') IS NOT NULL;")
+                if not cursor.fetchone()[0]:
+                    conn.commit()
+                    return
+                cursor.execute(
+                    "ALTER TABLE user_prompts ADD COLUMN IF NOT EXISTS updated_at "
+                    "TIMESTAMP DEFAULT NOW();"
+                )
+            conn.commit()
+            logging.info("user_prompts schema migration applied (if needed)")
+        except Exception as e:
+            conn.rollback()
+            logging.error(f"Error migrating user_prompts schema: {e}")
+            traceback.print_exc()
         finally:
             self.release_connection(conn)
 
@@ -897,6 +1051,289 @@ Tone: Professional and friendly"""
         except Exception as e:
             logging.error(f"Error getting call by ID: {e}")
             raise
+        finally:
+            self.release_connection(conn)
+
+    def get_call_dashboard_detail(self, call_id: str, user_id: int):
+        """Full call row including Retell webhook trail in events_log / agent_events."""
+        query = """
+            SELECT id, call_id, status, duration, transcript, summary, recording_url,
+                transcript_url, transcript_blob, recording_blob,
+                created_at, started_at, ended_at,
+                from_number, to_number, voice_name, events_log, agent_events
+            FROM call_history
+            WHERE call_id = %s AND user_id = %s
+        """
+        conn = self.get_connection()
+        try:
+            with conn.cursor(cursor_factory=RealDictCursor) as cursor:
+                cursor.execute(query, (call_id, user_id))
+                result = cursor.fetchone()
+                if result and isinstance(result.get("transcript"), str):
+                    try:
+                        result["transcript"] = json.loads(result["transcript"])
+                    except Exception:
+                        pass
+                for key in ("events_log", "agent_events"):
+                    if result and isinstance(result.get(key), str):
+                        try:
+                            result[key] = json.loads(result[key])
+                        except Exception:
+                            pass
+                return result
+        finally:
+            self.release_connection(conn)
+
+    def get_dashboard_summary_stats(self, user_id: int, days: int) -> dict:
+        """Aggregates for dashboard charts (call_history + appointments)."""
+        conn = self.get_connection()
+        try:
+            with conn.cursor(cursor_factory=RealDictCursor) as cursor:
+                cursor.execute(
+                    """
+                    SELECT
+                        COUNT(*)::int AS total_calls,
+                        COUNT(*) FILTER (WHERE status = 'completed')::int AS successful_calls,
+                        COUNT(*) FILTER (WHERE status = 'unanswered')::int AS unanswered_calls,
+                        COALESCE(SUM(duration), 0)::float AS total_duration_seconds
+                    FROM call_history
+                    WHERE user_id = %s
+                      AND created_at >= NOW() - (%s::int * INTERVAL '1 day')
+                    """,
+                    (user_id, max(1, min(days, 366))),
+                )
+                row = cursor.fetchone() or {}
+                cursor.execute(
+                    """
+                    SELECT COUNT(*)::int AS total
+                    FROM appointments
+                    WHERE user_id = %s
+                      AND created_at >= NOW() - (%s::int * INTERVAL '1 day')
+                    """,
+                    (user_id, max(1, min(days, 366))),
+                )
+                appt_row = cursor.fetchone() or {}
+                cursor.execute(
+                    """
+                    SELECT COUNT(*)::int AS cnt
+                    FROM (
+                        SELECT from_number
+                        FROM call_history
+                        WHERE user_id = %s
+                          AND from_number IS NOT NULL
+                          AND TRIM(from_number) <> ''
+                          AND created_at >= NOW() - (%s::int * INTERVAL '1 day')
+                        GROUP BY from_number
+                        HAVING COUNT(*) > 1
+                    ) t """,
+                    (user_id, max(1, min(days, 366))),
+                )
+                repeat_phones = cursor.fetchone() or {}
+                total_calls = int(row.get("total_calls") or 0)
+                unique_cursor = (
+                    """
+                    SELECT COUNT(DISTINCT from_number)::int AS u
+                    FROM call_history
+                    WHERE user_id = %s
+                      AND from_number IS NOT NULL
+                      AND TRIM(from_number) <> ''
+                      AND created_at >= NOW() - (%s::int * INTERVAL '1 day')
+                    """
+                )
+                cursor.execute(
+                    unique_cursor,
+                    (user_id, max(1, min(days, 366))),
+                )
+                uniq_row = cursor.fetchone() or {}
+                unique_phones = int(uniq_row.get("u") or 0)
+                repeat_n = int(repeat_phones.get("cnt") or 0)
+                new_callers = max(0, unique_phones - repeat_n)
+                total_minutes = float(row.get("total_duration_seconds") or 0) / 60.0
+                cursor.execute(
+                    """
+                    SELECT status, COUNT(*)::int AS c
+                    FROM appointments
+                    WHERE user_id = %s
+                      AND created_at >= NOW() - (%s::int * INTERVAL '1 day')
+                    GROUP BY status
+                    """,
+                    (user_id, max(1, min(days, 366))),
+                )
+                appt_status_rows = cursor.fetchall() or []
+                appointment_status_distribution = {
+                    r["status"]: r["c"] for r in appt_status_rows if r.get("status")
+                }
+                return {
+                    "total_calls": total_calls,
+                    "successful_calls": int(row.get("successful_calls") or 0),
+                    "unanswered_calls": int(row.get("unanswered_calls") or 0),
+                    "total_minutes": round(total_minutes, 2),
+                    "repeat_callers": repeat_n,
+                    "new_callers": new_callers,
+                    "total_appointments_in_period": int(appt_row.get("total") or 0),
+                    "appointment_status_distribution": appointment_status_distribution,
+                }
+        finally:
+            self.release_connection(conn)
+
+    def get_calls_over_time(self, user_id: int, days: int) -> list[dict]:
+        conn = self.get_connection()
+        try:
+            with conn.cursor(cursor_factory=RealDictCursor) as cursor:
+                cursor.execute(
+                    """
+                    SELECT
+                        (created_at AT TIME ZONE 'UTC')::date AS day,
+                        COUNT(*)::int AS count
+                    FROM call_history
+                    WHERE user_id = %s
+                      AND created_at >= NOW() - (%s::int * INTERVAL '1 day')
+                    GROUP BY day
+                    ORDER BY day ASC
+                    """,
+                    (user_id, max(1, min(days, 366))),
+                )
+                rows = cursor.fetchall() or []
+                return [{"date": r["day"].isoformat(), "count": r["count"]} for r in rows]
+        finally:
+            self.release_connection(conn)
+
+    def get_appointments_over_time(self, user_id: int, days: int) -> list[dict]:
+        conn = self.get_connection()
+        try:
+            with conn.cursor(cursor_factory=RealDictCursor) as cursor:
+                cursor.execute(
+                    """
+                    SELECT
+                        (created_at AT TIME ZONE 'UTC')::date AS day,
+                        COUNT(*)::int AS count
+                    FROM appointments
+                    WHERE user_id = %s
+                      AND created_at >= NOW() - (%s::int * INTERVAL '1 day')
+                    GROUP BY day
+                    ORDER BY day ASC
+                    """,
+                    (user_id, max(1, min(days, 366))),
+                )
+                rows = cursor.fetchall() or []
+                return [{"date": r["day"].isoformat(), "count": r["count"]} for r in rows]
+        finally:
+            self.release_connection(conn)
+
+    def get_top_repeat_callers(self, user_id: int, days: int, limit: int = 10) -> list[dict]:
+        conn = self.get_connection()
+        try:
+            with conn.cursor(cursor_factory=RealDictCursor) as cursor:
+                cursor.execute(
+                    """
+                    SELECT from_number AS phone, COUNT(*)::int AS call_count
+                    FROM call_history
+                    WHERE user_id = %s
+                      AND from_number IS NOT NULL
+                      AND TRIM(from_number) <> ''
+                      AND created_at >= NOW() - (%s::int * INTERVAL '1 day')
+                    GROUP BY from_number
+                    ORDER BY call_count DESC
+                    LIMIT %s
+                    """,
+                    (user_id, max(1, min(days, 366)), max(1, min(limit, 50))),
+                )
+                rows = cursor.fetchall() or []
+                return [
+                    {"phone": r["phone"], "name": "", "call_count": r["call_count"]}
+                    for r in rows
+                ]
+        finally:
+            self.release_connection(conn)
+
+    def get_sentiment_breakdown(self, user_id: int, days: int) -> dict[str, int]:
+        import re
+
+        rows = []
+        conn = self.get_connection()
+        try:
+            with conn.cursor() as cursor:
+                cursor.execute(
+                    """
+                    SELECT summary
+                    FROM call_history
+                    WHERE user_id = %s
+                      AND summary IS NOT NULL
+                      AND TRIM(summary) <> ''
+                      AND created_at >= NOW() - (%s::int * INTERVAL '1 day')
+                    """,
+                    (user_id, max(1, min(days, 366))),
+                )
+                rows = cursor.fetchall()
+        finally:
+            self.release_connection(conn)
+        breakdown: dict[str, int] = {}
+        pat = re.compile(r"Sentiment:\s*([^\n]+)", re.IGNORECASE)
+        for (summary,) in rows:
+            if not summary:
+                continue
+            m = pat.search(str(summary))
+            if m:
+                label = m.group(1).strip().lower()
+                if len(label) > 64:
+                    label = label[:64]
+                breakdown[label] = breakdown.get(label, 0) + 1
+            else:
+                breakdown["unknown"] = breakdown.get("unknown", 0) + 1
+        return breakdown
+
+    def get_dashboard_combined_stats(self, user_id: int) -> dict:
+        """Lightweight counters for dashboard header widgets."""
+        conn = self.get_connection()
+        try:
+            with conn.cursor(cursor_factory=RealDictCursor) as cursor:
+                cursor.execute(
+                    """
+                    SELECT COUNT(*)::int AS total
+                    FROM call_history
+                    WHERE user_id = %s
+                    """,
+                    (user_id,),
+                )
+                total_calls = (cursor.fetchone() or {}).get("total") or 0
+                cursor.execute(
+                    """
+                    SELECT COUNT(*)::int AS c
+                    FROM call_history
+                    WHERE user_id = %s AND status = 'completed'
+                    """,
+                    (user_id,),
+                )
+                completed = (cursor.fetchone() or {}).get("c") or 0
+                cursor.execute(
+                    """
+                    SELECT COUNT(*)::int AS c
+                    FROM call_history
+                    WHERE user_id = %s
+                      AND created_at >= date_trunc('day', NOW() AT TIME ZONE 'utc')
+                    """,
+                    (user_id,),
+                )
+                calls_today = (cursor.fetchone() or {}).get("c") or 0
+                cursor.execute(
+                    """
+                    SELECT COUNT(*)::int AS c
+                    FROM appointments
+                    WHERE user_id = %s AND status = 'scheduled'
+                    """,
+                    (user_id,),
+                )
+                appt_scheduled = (cursor.fetchone() or {}).get("c") or 0
+                return {
+                    "calls": {
+                        "total": total_calls,
+                        "completed": completed,
+                        "today": calls_today,
+                    },
+                    "appointments": {
+                        "scheduled": appt_scheduled,
+                    },
+                }
         finally:
             self.release_connection(conn)
 

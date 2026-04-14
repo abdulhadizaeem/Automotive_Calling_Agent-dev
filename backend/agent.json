@@ -1,0 +1,22 @@
+{
+  "description": "Retell Conversation Flow notes for SUMA (inbound). Apply in Retell dashboard or via API export/import.",
+  "remove_tools": [
+    {
+      "name": "get_current_datetime",
+      "reason": "Date/time is injected by POST /api/retell-inbound-webhook as dynamic variables."
+    }
+  ],
+  "dynamic_variables_from_backend": [
+    "user_id",
+    "agent_name",
+    "business_name",
+    "call_context",
+    "current_date",
+    "iso_date",
+    "current_time",
+    "day_of_week",
+    "timezone"
+  ],
+  "global_prompt_addendum": "You always know the current local context date and time from the inbound webhook. Use these exactly when scheduling or reasoning about dates — do not claim you cannot see the date.\n\n- Today: {{current_date}} (ISO {{iso_date}}), {{day_of_week}}.\n- Time: {{current_time}} (timezone {{timezone}}).\n- You are {{agent_name}} representing {{business_name}}.\n- Mission / context: {{call_context}}\n\nDo not call any HTTP tool only to fetch the current date or time; rely on the variables above.",
+  "example_begin_message": "Hi, this is {{agent_name}} at {{business_name}}. How can I help you today?"
+}

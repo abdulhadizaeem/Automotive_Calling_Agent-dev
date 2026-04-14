@@ -42,6 +42,7 @@ from src.utils.retell_utils import (
     verify_retell_signature,
     apply_retell_webhook_event,
     resolve_inbound_user_id,
+    retell_get_call,
 )
 
 load_dotenv()
@@ -255,11 +256,26 @@ async def retell_inbound_webhook(request: Request):
         except Exception:
             settings = None
 
+        tz_name = (os.getenv("RETELL_INBOUND_TIMEZONE") or "UTC").strip()
+        try:
+            from zoneinfo import ZoneInfo
+
+            now = datetime.now(ZoneInfo(tz_name))
+            tz_label = tz_name
+        except Exception:
+            now = datetime.now(timezone.utc)
+            tz_label = "UTC"
         dv = {
             "user_id": str(user_id),
             "agent_name": (settings or {}).get("agent_name") or "SUMA",
             "business_name": (settings or {}).get("business_name") or "our business",
             "call_context": (settings or {}).get("call_context") or "",
+            # Current date/time for prompts (no separate tool call needed).
+            "current_date": now.strftime("%Y-%m-%d"),
+            "iso_date": now.date().isoformat(),
+            "current_time": now.strftime("%H:%M"),
+            "day_of_week": now.strftime("%A"),
+            "timezone": tz_label,
         }
         # Response engine: dynamic_variables (general) + retell_llm_dynamic_variables (Retell LLM)
         body["call_inbound"]["dynamic_variables"] = dv
@@ -283,8 +299,100 @@ async def retell_health():
         },
     )
 
+
+class DashboardReportSummary(BaseModel):
+    total_calls: int
+    total_appointments: int
+    total_minutes: float
+    successful_calls: int
+    unanswered_calls: int = 0
+    repeat_callers: int
+    new_callers: int
+    appointment_status_distribution: dict = {}
+
+
+class DashboardRepeatCallerItem(BaseModel):
+    phone: str
+    name: str
+    call_count: int
+
+
+class DashboardReportResponse(BaseModel):
+    period_days: int
+    summary: DashboardReportSummary
+    calls_over_time: list[dict]
+    appointments_over_time: list[dict]
+    top_repeat_callers: list[DashboardRepeatCallerItem]
+    sentiment_breakdown: dict
+
+
+@router.get("/dashboard/reports", response_model=DashboardReportResponse)
+async def dashboard_reports(
+    days: int = Query(7, ge=1, le=366),
+    user=Depends(get_current_user),
+):
+    """Time-series and aggregates from call_history + appointments (for charts)."""
+    uid = user["id"]
+    summary_raw = db.get_dashboard_summary_stats(uid, days)
+    summary = DashboardReportSummary(
+        total_calls=summary_raw["total_calls"],
+        total_appointments=summary_raw["total_appointments_in_period"],
+        total_minutes=summary_raw["total_minutes"],
+        successful_calls=summary_raw["successful_calls"],
+        unanswered_calls=summary_raw["unanswered_calls"],
+        repeat_callers=summary_raw["repeat_callers"],
+        new_callers=summary_raw["new_callers"],
+        appointment_status_distribution=summary_raw.get("appointment_status_distribution") or {},
+    )
+    calls_over_time = db.get_calls_over_time(uid, days)
+    appointments_over_time = db.get_appointments_over_time(uid, days)
+    top = db.get_top_repeat_callers(uid, days, limit=10)
+    sentiment = db.get_sentiment_breakdown(uid, days)
+    return DashboardReportResponse(
+        period_days=days,
+        summary=summary,
+        calls_over_time=calls_over_time,
+        appointments_over_time=appointments_over_time,
+        top_repeat_callers=[DashboardRepeatCallerItem(**x) for x in top],
+        sentiment_breakdown=sentiment,
+    )
+
+
+@router.get("/dashboard/stats")
+async def dashboard_quick_stats(user=Depends(get_current_user)):
+    """Compact counters for header widgets."""
+    return JSONResponse(db.get_dashboard_combined_stats(user["id"]))
+
+
+@router.get("/dashboard/calls/{call_id}")
+async def dashboard_call_detail(call_id: str, user=Depends(get_current_user)):
+    """Call row plus Retell webhook trail (events_log, agent_events)."""
+    row = db.get_call_dashboard_detail(call_id, user["id"])
+    if not row:
+        raise HTTPException(status_code=404, detail="Call not found")
+    return JSONResponse(content=jsonable_encoder(row))
+
+
+@router.get("/dashboard/calls/{call_id}/live")
+async def dashboard_call_live(call_id: str, user=Depends(get_current_user)):
+    """Live call payload from Retell (for active calls or post-mortem metadata)."""
+    row = db.get_call_by_id(call_id, user["id"])
+    if not row:
+        raise HTTPException(status_code=404, detail="Call not found")
+    try:
+        payload = retell_get_call(call_id)
+    except Exception as e:
+        logging.error("Retell get-call failed for %s: %s", call_id, e)
+        raise HTTPException(status_code=502, detail=str(e))
+    return JSONResponse(content=payload)
+
+
 @router.get("/agent/get-current-datetime")
 async def agent_get_current_datetime():
+    """
+    Legacy: prefer inbound webhook dynamic variables (current_date, current_time, …) in the
+    Retell prompt instead of a tool call. Remove the tool from your Conversation Flow when migrated.
+    """
     now = datetime.now(timezone.utc)
     return JSONResponse(
         {
