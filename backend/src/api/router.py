@@ -961,7 +961,10 @@ async def book_appointment(request: Request):
     """
     try:
         data = await request.json()
-        
+
+        # Always resolve to a valid business user id.
+        # - Prefer a valid payload user_id (if present)
+        # - Otherwise fall back to RETELL_DEFAULT_INBOUND_USER_ID
         user_id = resolve_agent_tool_user_id(data.get("user_id"))
         appointment_date = data.get("appointment_date")
         start_time = data.get("start_time")
@@ -973,13 +976,20 @@ async def book_appointment(request: Request):
         organizer_email = data.get("organizer_email")
 
         if user_id is None:
+            logging.error("book-appointment: could not resolve user_id. raw=%r env=%r", data.get("user_id"), os.getenv("RETELL_DEFAULT_INBOUND_USER_ID"))
             return error_response(
-                "Invalid or missing user_id. Set RETELL_DEFAULT_INBOUND_USER_ID or pass user_id in the tool payload.",
+                "Could not resolve business user_id. Set RETELL_DEFAULT_INBOUND_USER_ID (users.id).",
                 status_code=400,
             )
 
-        if not all([appointment_date, start_time]):
-            return error_response("Missing required fields", status_code=400)
+        missing: list[str] = []
+        if not appointment_date:
+            missing.append("appointment_date")
+        if not start_time:
+            missing.append("start_time")
+        if missing:
+            logging.error("book-appointment: missing required fields=%s payload_keys=%s", missing, list(data.keys()))
+            return error_response(f"Missing required fields: {', '.join(missing)}", status_code=400)
 
         # Tool callers sometimes omit organizer_name; default safely for inbound dealership use.
         if not organizer_name:
