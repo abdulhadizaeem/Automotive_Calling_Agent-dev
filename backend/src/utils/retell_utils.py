@@ -192,10 +192,68 @@ def format_call_analysis_for_db(call: dict[str, Any]) -> Optional[str]:
     return "\n\n".join(parts)
 
 
-def _event_dedupe_key(event: str, call_id: str, payload: dict[str, Any]) -> str:
+def _event_dedupe_key(event: Optional[str], call_id: str, payload: dict[str, Any]) -> str:
     raw = json.dumps(payload, sort_keys=True, default=str)
     h = hashlib.sha256(raw.encode("utf-8")).hexdigest()[:24]
-    return f"{event}:{call_id}:{h}"
+    return f"{event or 'unknown'}:{call_id}:{h}"
+
+
+def extract_retell_event_and_call(payload: dict[str, Any]) -> tuple[Optional[str], dict[str, Any]]:
+    """
+    Normalize Retell POST body: event name + call-shaped dict.
+    Some deliveries nest fields under 'call'; others duplicate keys at the root — merge both.
+    """
+    if not isinstance(payload, dict):
+        return None, {}
+    ev = payload.get("event") or payload.get("event_type") or payload.get("type")
+    if isinstance(ev, str):
+        ev = ev.strip().lower() or None
+    raw_call = payload.get("call")
+    call: dict[str, Any] = dict(raw_call) if isinstance(raw_call, dict) else {}
+    spill_keys = (
+        "call_id",
+        "agent_id",
+        "call_type",
+        "from_number",
+        "to_number",
+        "start_timestamp",
+        "end_timestamp",
+        "duration_ms",
+        "disconnection_reason",
+        "transcript",
+        "transcript_object",
+        "transcript_with_tool_calls",
+        "recording_url",
+        "recording_multi_channel_url",
+        "call_analysis",
+        "metadata",
+        "collected_dynamic_variables",
+    )
+    for k in spill_keys:
+        if k in payload and payload[k] is not None and (k not in call or call[k] is None):
+            call[k] = payload[k]
+    cid = call.get("call_id")
+    if cid is not None:
+        call["call_id"] = str(cid)
+    return ev, call
+
+def _norm_event(ev: Optional[str]) -> Optional[str]:
+    if not ev:
+        return None
+    e = str(ev).strip().lower()
+    if not e:
+        return None
+    # tolerate common variations / older names
+    aliases = {
+        "call_end": "call_ended",
+        "ended": "call_ended",
+        "call_start": "call_started",
+        "started": "call_started",
+        "analyzed": "call_analyzed",
+        "analysis_completed": "call_analyzed",
+        "transcript": "transcript_updated",
+    }
+    return aliases.get(e, e)
 
 
 def _should_apply_status(db, call_id: str, new_status: str) -> bool:
@@ -219,15 +277,39 @@ def _should_apply_status(db, call_id: str, new_status: str) -> bool:
         db.release_connection(conn)
 
 
-def apply_retell_webhook_event(db, event: str, payload: dict[str, Any]) -> None:
+def apply_retell_webhook_event(db, payload: dict[str, Any]) -> None:
     """Normalize Retell POST /retell-webhook JSON into call_history."""
     from src.utils.utils import calculate_duration
 
-    call = payload.get("call") or {}
+    event, call = extract_retell_event_and_call(payload)
+    event = _norm_event(event)
     call_id = call.get("call_id")
     if not call_id:
-        logger.warning("Retell webhook missing call.call_id")
+        logger.warning(
+            "Retell webhook missing call_id (check root vs call object). keys=%s",
+            list(payload.keys())[:20] if isinstance(payload, dict) else None,
+        )
         return
+
+    logger.info("Retell webhook received event=%s call_id=%s", event, call_id)
+
+    # If transcript/analyzed arrives before started, create a minimal row so we can persist fields.
+    # (Retell delivery order can vary.)
+    def _ensure_row_exists(default_status: str = "connected") -> None:
+        if db.call_exists(call_id):
+            return
+        user_id = resolve_user_from_call(call)
+        if user_id is None:
+            logger.error("Cannot create call_history row without user_id for call_id=%s", call_id)
+            return
+        db.insert_call_history(
+            user_id=user_id,
+            call_id=call_id,
+            status=default_status,
+            voice_name="retell",
+            to_number=call.get("to_number"),
+            from_number=call.get("from_number"),
+        )
 
     if event in (
         "transfer_started",
@@ -288,6 +370,10 @@ def apply_retell_webhook_event(db, event: str, payload: dict[str, Any]) -> None:
 
     if event == "transcript_updated":
         if not db.call_exists(call_id):
+            _ensure_row_exists(default_status="connected")
+        if not db.call_exists(call_id):
+            # still can't create row (likely missing user_id)
+            logger.info("Retell transcript_updated ignored: no call_history row for call_id=%s", call_id)
             return
         snap = build_transcript_payload(call)
         if snap:
@@ -372,6 +458,8 @@ def apply_retell_webhook_event(db, event: str, payload: dict[str, Any]) -> None:
 
     if event == "call_analyzed":
         if not db.call_exists(call_id):
+            _ensure_row_exists(default_status="connected")
+        if not db.call_exists(call_id):
             return
         summary = format_call_analysis_for_db(call) or extract_call_summary(call)
         if summary:
@@ -383,6 +471,19 @@ def apply_retell_webhook_event(db, event: str, payload: dict[str, Any]) -> None:
             pass
         db.record_retell_webhook_event(call_id, dedupe, event)
         return
+
+    _handled = {
+        "call_started",
+        "transcript_updated",
+        "call_ended",
+        "call_analyzed",
+        "transfer_started",
+        "transfer_bridged",
+        "transfer_cancelled",
+        "transfer_ended",
+    }
+    if event not in _handled:
+        logger.warning("Retell webhook unhandled event=%r call_id=%s", event, call_id)
 
     db.record_retell_webhook_event(call_id, dedupe, event)
 

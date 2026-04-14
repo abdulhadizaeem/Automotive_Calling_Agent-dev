@@ -208,9 +208,8 @@ async def retell_webhook(request: Request):
         data = json.loads(raw_body)
     except json.JSONDecodeError:
         return JSONResponse(status_code=400, content={"message": "Invalid JSON"})
-    event = data.get("event")
     try:
-        apply_retell_webhook_event(db, event, data)
+        apply_retell_webhook_event(db, data)
     except Exception as e:
         logging.error("retell-webhook handler error: %s", e)
         traceback.print_exc()
