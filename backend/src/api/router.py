@@ -426,6 +426,19 @@ async def agent_check_availability(body: CheckAvailabilityRequest):
     """
     try:
         uid = int(body.user_id)
+        # Validate user exists (prevents FK / bad mapping issues downstream)
+        try:
+            if not db.get_user_by_id(uid):
+                return JSONResponse(
+                    status_code=200,
+                    content={
+                        "available": True,
+                        "message": "I couldn't verify availability for this account right now.",
+                        "warning": "invalid_user_id_mapping",
+                    },
+                )
+        except Exception:
+            pass
         appt_date = body.appointment_date
         start = body.start_time
         end = body.end_time
@@ -434,25 +447,37 @@ async def agent_check_availability(body: CheckAvailabilityRequest):
             start_dt = datetime.strptime(start, "%H:%M")
             end = (start_dt + timedelta(hours=1)).strftime("%H:%M")
 
-        conn = db.get_connection()
-        try:
-            with conn.cursor() as cursor:
-                cursor.execute(
-                    """
-                    SELECT appointment_date, start_time, end_time, title, attendee_name
-                    FROM appointments
-                    WHERE user_id = %s
-                      AND appointment_date = %s
-                      AND status = 'scheduled'
-                      AND (start_time < %s::time AND end_time > %s::time)
-                    ORDER BY start_time
-                    LIMIT 1
-                    """,
-                    (uid, appt_date, end, start),
-                )
-                row = cursor.fetchone()
-        finally:
-            db.release_connection(conn)
+        row = None
+        for attempt in range(2):
+            conn = db.get_connection()
+            try:
+                with conn.cursor() as cursor:
+                    cursor.execute(
+                        """
+                        SELECT appointment_date, start_time, end_time, title, attendee_name
+                        FROM appointments
+                        WHERE user_id = %s
+                          AND appointment_date = %s
+                          AND status = 'scheduled'
+                          AND (start_time < %s::time AND end_time > %s::time)
+                        ORDER BY start_time
+                        LIMIT 1
+                        """,
+                        (uid, appt_date, end, start),
+                    )
+                    row = cursor.fetchone()
+                break
+            except Exception as e:
+                logging.error("check-availability error: %s", e)
+                try:
+                    conn.rollback()
+                except Exception:
+                    pass
+                if attempt == 0:
+                    continue
+                row = None
+            finally:
+                db.release_connection(conn)
 
         if row:
             conflict_details = {
@@ -960,12 +985,23 @@ async def book_appointment(request: Request):
             except ValueError:
                 return error_response("Invalid start_time; use HH:MM", status_code=400)
 
+        # Validate user exists (prevents FK failures).
+        u = None
+        try:
+            u = db.get_user_by_id(user_id)
+        except Exception:
+            u = None
+        if not u:
+            return error_response(
+                "Invalid business user mapping for this inbound number. Configure RETELL_DEFAULT_INBOUND_USER_ID or RETELL_INBOUND_NUMBER_USER_MAP.",
+                status_code=400,
+            )
+
         # If caller didn't provide email, fall back to the business user's email.
         # This prevents production failures (appointments.attendee_email is NOT NULL).
         attendee_email = organizer_email
         if not attendee_email:
             try:
-                u = db.get_user_by_id(user_id)
                 attendee_email = (u.get("email") if isinstance(u, dict) else None) or "no-reply@example.com"
             except Exception:
                 attendee_email = "no-reply@example.com"

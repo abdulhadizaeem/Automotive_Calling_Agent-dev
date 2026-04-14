@@ -26,11 +26,15 @@ class PGDB:
             return  # Already initialized
             
         self.connection_string = os.getenv('DATABASE_URL')
-        
-        # ✅ Create pool ONCE
-        PGDB._pool = pool.SimpleConnectionPool(
-            5, 50, self.connection_string
-        )
+        self.disable_pool = os.getenv("DISABLE_PG_POOL", "false").lower() in ("1", "true", "yes")
+
+        # Some Postgres+SSL setups drop idle pooled connections, causing:
+        # "SSL connection has been closed unexpectedly".
+        # Allow disabling pooling and opening a fresh connection per request.
+        if not self.disable_pool:
+            PGDB._pool = pool.SimpleConnectionPool(5, 50, self.connection_string)
+        else:
+            PGDB._pool = None
         
         # ✅ Create tables ONCE (in correct order due to foreign keys)
         self.create_users_table()
@@ -45,12 +49,57 @@ class PGDB:
         self.ensure_user_prompts_schema()
 
     def get_connection(self):
-        """Get connection from pool"""
-        return PGDB._pool.getconn()
+        """
+        Get a live DB connection.
+        - If pooling is disabled: open a fresh connection each call.
+        - If pooling is enabled: lease from pool and probe liveness, replacing stale sockets.
+        """
+        if getattr(self, "disable_pool", False) or PGDB._pool is None:
+            return psycopg2.connect(self.connection_string)
+
+        conn = PGDB._pool.getconn()
+        try:
+            # Probe liveness (cheap, catches stale SSL sockets)
+            with conn.cursor() as cursor:
+                cursor.execute("SELECT 1;")
+            return conn
+        except psycopg2.Error:
+            # Drop broken connection and retry once
+            try:
+                PGDB._pool.putconn(conn, close=True)
+            except Exception:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+            conn2 = PGDB._pool.getconn()
+            try:
+                with conn2.cursor() as cursor:
+                    cursor.execute("SELECT 1;")
+            except Exception:
+                # if this also fails, let caller handle
+                pass
+            return conn2
     
     def release_connection(self, conn):
         """Return connection to pool"""
-        PGDB._pool.putconn(conn)
+        try:
+            if conn is None:
+                return
+            if getattr(self, "disable_pool", False) or PGDB._pool is None:
+                try:
+                    conn.close()
+                finally:
+                    return
+            if getattr(conn, "closed", 0):
+                PGDB._pool.putconn(conn, close=True)
+            else:
+                PGDB._pool.putconn(conn)
+        except Exception:
+            try:
+                conn.close()
+            except Exception:
+                pass
 
     # ==================== TABLE CREATION METHODS ====================
     
@@ -1595,35 +1644,57 @@ Tone: Professional and friendly"""
         Create a new appointment in the database
         Returns the appointment ID
         """
-        conn = self.get_connection()
-        try:
-            with conn.cursor() as cursor:
-                cursor.execute("""
-                    INSERT INTO appointments (
+        last_err: Exception | None = None
+        for attempt in range(2):
+            conn = self.get_connection()
+            try:
+                with conn.cursor() as cursor:
+                    cursor.execute("""
+                        INSERT INTO appointments (
+                            user_id, appointment_date, start_time, end_time,
+                            attendee_name, attendee_email, title, description,
+                            status, created_at
+                        )
+                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, NOW())
+                        RETURNING id
+                    """, (
                         user_id, appointment_date, start_time, end_time,
                         attendee_name, attendee_email, title, description,
-                        status, created_at
-                    )
-                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, NOW())
-                    RETURNING id
-                """, (
-                    user_id, appointment_date, start_time, end_time,
-                    attendee_name, attendee_email, title, description,
-                    'scheduled'
-                ))
-                
-                appointment_id = cursor.fetchone()[0]
-                conn.commit()
-                
-                logging.info(f"✅ Created appointment {appointment_id} for user {user_id}")
-                return appointment_id
-                
-        except Exception as e:
-            conn.rollback()
-            logging.error(f"❌ Error creating appointment: {e}")
-            raise
-        finally:
-            self.release_connection(conn)
+                        'scheduled'
+                    ))
+
+                    appointment_id = cursor.fetchone()[0]
+                    conn.commit()
+
+                    logging.info(f"✅ Created appointment {appointment_id} for user {user_id}")
+                    return appointment_id
+            except psycopg2.OperationalError as e:
+                last_err = e
+                # stale SSL socket / dropped connection; retry once with a fresh connection
+                try:
+                    conn.rollback()
+                except Exception:
+                    pass
+                try:
+                    self.release_connection(conn)
+                except Exception:
+                    pass
+                if attempt == 0:
+                    continue
+                raise
+            except Exception as e:
+                last_err = e
+                try:
+                    conn.rollback()
+                except Exception:
+                    pass
+                logging.error(f"❌ Error creating appointment: {e}")
+                raise
+            finally:
+                self.release_connection(conn)
+
+        # should never reach
+        raise last_err or RuntimeError("create_appointment failed")
 
 
 # import os
