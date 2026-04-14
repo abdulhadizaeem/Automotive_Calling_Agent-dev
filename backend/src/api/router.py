@@ -418,8 +418,20 @@ async def agent_check_availability(body: CheckAvailabilityRequest):
     Returns {available: bool, message: str, conflict_details?: {...}}
     """
     try:
+        logging.info(
+            "check-availability: raw user_id=%r appointment_date=%r start_time=%r end_time=%r",
+            body.user_id,
+            getattr(body, "appointment_date", None),
+            getattr(body, "start_time", None),
+            getattr(body, "end_time", None),
+        )
         uid = resolve_agent_tool_user_id(body.user_id)
         if uid is None:
+            logging.error(
+                "check-availability: could not resolve user_id. raw=%r env=%r",
+                body.user_id,
+                os.getenv("RETELL_DEFAULT_INBOUND_USER_ID"),
+            )
             return JSONResponse(
                 status_code=200,
                 content={
@@ -428,9 +440,11 @@ async def agent_check_availability(body: CheckAvailabilityRequest):
                     "warning": "missing_user_id",
                 },
             )
+        logging.info("check-availability: resolved user_id=%s", uid)
         # Validate user exists (prevents FK / bad mapping issues downstream)
         try:
             if not db.get_user_by_id(uid):
+                logging.error("check-availability: user not found for user_id=%s", uid)
                 return JSONResponse(
                     status_code=200,
                     content={
@@ -448,6 +462,7 @@ async def agent_check_availability(body: CheckAvailabilityRequest):
             # default to 1h duration
             start_dt = datetime.strptime(start, "%H:%M")
             end = (start_dt + timedelta(hours=1)).strftime("%H:%M")
+        logging.info("check-availability: query user_id=%s date=%s start=%s end=%s", uid, appt_date, start, end)
 
         row = None
         for attempt in range(2):
@@ -482,6 +497,7 @@ async def agent_check_availability(body: CheckAvailabilityRequest):
                 db.release_connection(conn)
 
         if row:
+            logging.info("check-availability: conflict found for user_id=%s date=%s", uid, appt_date)
             conflict_details = {
                 "appointment_date": str(row[0]),
                 "start_time": str(row[1]),
@@ -962,18 +978,40 @@ async def book_appointment(request: Request):
     try:
         data = await request.json()
 
+        # Minimal logging for debugging tool payload issues (do not log transcript text).
+        try:
+            logging.info(
+                "book-appointment: incoming keys=%s raw_user_id=%r",
+                list(data.keys()) if isinstance(data, dict) else None,
+                (data.get("user_id") if isinstance(data, dict) else None),
+            )
+        except Exception:
+            pass
+
         # Always resolve to a valid business user id.
         # - Prefer a valid payload user_id (if present)
         # - Otherwise fall back to RETELL_DEFAULT_INBOUND_USER_ID
         user_id = resolve_agent_tool_user_id(data.get("user_id"))
-        appointment_date = data.get("appointment_date")
-        start_time = data.get("start_time")
-        end_time = data.get("end_time")
+        # Accept a few common alternate field names (some flows send date/time keys).
+        appointment_date = data.get("appointment_date") or data.get("date") or data.get("reservation_date")
+        start_time = data.get("start_time") or data.get("time") or data.get("appointment_time")
+        end_time = data.get("end_time") or data.get("end")
         attendee_name = data.get("attendee_name", "Valued Customer")
         title = data.get("title", "Appointment")
         description = data.get("description", "")
         organizer_name = (data.get("organizer_name") or "").strip()
         organizer_email = data.get("organizer_email")
+
+        logging.info(
+            "book-appointment: resolved user_id=%r appointment_date=%r start_time=%r end_time=%r title=%r attendee_name=%r email_present=%s",
+            user_id,
+            appointment_date,
+            start_time,
+            end_time,
+            title,
+            attendee_name,
+            bool(organizer_email),
+        )
 
         if user_id is None:
             logging.error("book-appointment: could not resolve user_id. raw=%r env=%r", data.get("user_id"), os.getenv("RETELL_DEFAULT_INBOUND_USER_ID"))
@@ -997,10 +1035,14 @@ async def book_appointment(request: Request):
 
         if not end_time:
             try:
-                st = datetime.strptime(start_time, "%H:%M")
+                # tolerate "HH:MM:SS"
+                st_raw = str(start_time).strip()
+                fmt = "%H:%M:%S" if len(st_raw.split(":")) == 3 else "%H:%M"
+                st = datetime.strptime(st_raw, fmt)
                 end_time = (st + timedelta(hours=1)).strftime("%H:%M")
             except ValueError:
-                return error_response("Invalid start_time; use HH:MM", status_code=400)
+                logging.error("book-appointment: invalid start_time=%r payload=%r", start_time, data)
+                return error_response("Invalid start_time; use HH:MM (24-hour)", status_code=400)
 
         # Validate user exists (prevents FK failures).
         u = None
@@ -1009,8 +1051,9 @@ async def book_appointment(request: Request):
         except Exception:
             u = None
         if not u:
+            logging.error("book-appointment: user not found user_id=%r env_default=%r", user_id, os.getenv("RETELL_DEFAULT_INBOUND_USER_ID"))
             return error_response(
-                "Invalid business user mapping for this inbound number. Configure RETELL_DEFAULT_INBOUND_USER_ID or RETELL_INBOUND_NUMBER_USER_MAP.",
+                f"Invalid business user mapping (user_id={user_id}). Ensure this users.id exists, or set RETELL_DEFAULT_INBOUND_USER_ID / RETELL_INBOUND_NUMBER_USER_MAP.",
                 status_code=400,
             )
 
