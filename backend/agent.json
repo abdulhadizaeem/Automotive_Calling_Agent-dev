@@ -1,17 +1,18 @@
 {
   "agent_id": "",
   "channel": "voice",
-  "last_modification_timestamp": 1776082519254,
+  "last_modification_timestamp": 1776177630178,
   "agent_name": "SUMA Inbound Booking Agent",
   "response_engine": {
     "type": "conversation-flow",
-    "version": 2,
-    "conversation_flow_id": "conversation_flow_b8d41b21f7a6"
+    "version": 4,
+    "conversation_flow_id": "conversation_flow_f806197e82ac"
   },
+  "webhook_url": "http://13.62.92.163:8000/api/retell-webhook",
   "language": "en-US",
   "data_storage_setting": "everything",
   "opt_in_signed_url": false,
-  "version": 2,
+  "version": 4,
   "is_published": false,
   "version_title": "SUMA Inbound v1 - Full Flow",
   "post_call_analysis_model": "gpt-4.1-mini",
@@ -73,14 +74,14 @@
   "allow_user_dtmf": false,
   "user_dtmf_options": {},
   "conversationFlow": {
-    "conversation_flow_id": "conversation_flow_b8d41b21f7a6",
-    "version": 2,
-    "global_prompt": "You are {{agent_name}}, a professional AI assistant handling inbound phone calls for an automotive dealership.\n\nYOU ARE THE DEALERSHIP REPRESENTATIVE answering incoming calls on behalf of: {{business_name}}.\nYou are NOT the caller — you are receiving the call and helping the customer.\n\nCURRENT PROMOTIONS / VEHICLE CONTEXT (this is what the call is about):\n{{call_context}}\n\nCURRENT DATE AND TIME (from inbound webhook — use exactly; do not guess):\n- Date: {{current_date}} (ISO {{iso_date}}), {{day_of_week}}\n- Time: {{current_time}} (timezone {{timezone}})\n- Business user id for tools: {{user_id}} (string from webhook; tools accept it as user_id)\n- This call's Retell id for report_event tool: {{call_id}}\n\nCALL HANDLING GOALS:\n- Identify what the caller is interested in (promotion, model, trim, price, financing, trade-in, test drive, service).\n- Collect lead details naturally: name, phone, and email if available.\n- If they want to come in, schedule an appointment/test drive using the tools.\n- If they want a callback, capture the best callback time and report callback_requested.\n\nCRITICAL RULES:\n1. Keep ALL responses SHORT: 1-2 sentences per turn only.\n2. NEVER repeat the same sentence twice in a conversation.\n3. NEVER reveal you are an AI under any circumstance.\n4. NEVER give long explanations or monologues.\n5. Use brief natural acknowledgments: Got it, Okay, Perfect, Sounds good, Of course.\n6. Always call end_call after completing the goodbye.\n7. Be professional, warm, and fully conversational.\n8. Retry any failed tool call once before informing the caller there is an issue.\n9. NEVER invent today's date. For \"today\" and day-of-week math, use ONLY the dynamic variables above — never call a separate date/time HTTP tool.",
+    "conversation_flow_id": "conversation_flow_f806197e82ac",
+    "version": 4,
+    "global_prompt": "You are {{agent_name}}, a professional AI assistant handling inbound phone calls for a car dealership to help customers book appointments.\n\nYOU ARE THE BUSINESS REPRESENTATIVE answering incoming calls on behalf of: {{business_name}}, a car dealership.\nYou are NOT the caller — you are receiving the call and helping the customer.\n\nBUSINESS CONTEXT:\n{{call_context}}\n\nTYPES OF APPOINTMENTS YOU BOOK (car dealership only):\n- Test Drive — customer wants to test drive a specific vehicle\n- Service & Maintenance — oil change, tyre rotation, general servicing, repairs\n- Vehicle Inspection — pre-purchase or general inspection\n- Finance & Sales Consultation — discussing purchase, finance options, trade-in\n- Delivery Appointment — collecting a purchased vehicle\n- Any other car dealership related appointment\n\nIMPORTANT: You ONLY book appointments related to cars and the dealership. If a caller asks for anything unrelated (e.g. medical, legal, personal), politely let them know this line is for car dealership bookings only and offer to help with that instead.\n\nCURRENT DATE AND TIME (from inbound webhook — use exactly; do not guess):\n- Date: {{current_date}} (ISO {{iso_date}}), {{day_of_week}}\n- Time: {{current_time}} (timezone {{timezone}})\n- Business user id for tools: {{user_id}} (string from webhook; tools accept it as user_id)\n- This call's Retell id for report_event tool: {{call_id}}\n\nCRITICAL RULES:\n1. Keep ALL responses SHORT: 1-2 sentences per turn only.\n2. NEVER repeat the same sentence twice in a conversation.\n3. NEVER reveal you are an AI under any circumstance.\n4. NEVER give long explanations or monologues.\n5. Use brief natural acknowledgments: Got it, Okay, Perfect, Sounds good, Of course.\n6. Always transition to Closing_State and then end the call after completing the goodbye — NEVER leave the call open.\n7. Be professional, warm, and fully conversational.\n8. Retry any failed tool call once before informing the caller there is an issue.\n9. NEVER invent today's date. For \"today\" and day-of-week math, use ONLY the dynamic variables above — never call a separate date/time HTTP tool.",
     "nodes": [
       {
         "instruction": {
           "type": "prompt",
-          "text": "An inbound call has just connected. Answer warmly and professionally as a representative of the business.\n\nSay: 'Thank you for calling {{business_name}}! This is SUMA — how can I help you today?'\n\nThen wait for the caller's response.\n\nIf they state they want to book an appointment, transition to Negotiate_State to discuss date and time (you already have today's date from the system: {{current_date}}, {{day_of_week}}).\nIf they are unsure or asking a general question, transition to Purpose_State to understand their need.\nIf there is no response or the call seems like a misdial, transition to Closing_State."
+          "text": "An inbound call has just connected. Answer warmly and professionally as a representative of the car dealership.\n\nSay: 'Thank you for calling suma motors! This is SUMA — how can I help you today?'\n\nThen wait for the caller's response.\n\nIf they state they want to book an appointment (test drive, service, inspection, finance consultation, delivery, or any dealership-related visit), transition to Negotiate_State.\nIf they are unsure or asking a general question, transition to Purpose_State to understand their need.\nIf the request is unrelated to the car dealership, politely explain this line is for dealership appointments only and offer to help with one.\nIf there is no response or the call seems like a misdial, transition to Closing_State."
         },
         "model_choice": {
           "type": "cascading",
@@ -94,7 +95,7 @@
             "id": "edge-intro-to-negotiate",
             "transition_condition": {
               "type": "prompt",
-              "prompt": "Caller has clearly stated they want to book an appointment."
+              "prompt": "Caller has clearly stated with the type of appointment they want to book "
             }
           },
           {
@@ -102,7 +103,7 @@
             "id": "edge-intro-to-purpose",
             "transition_condition": {
               "type": "prompt",
-              "prompt": "Caller's need is unclear or they are asking a general question."
+              "prompt": "Caller's need is unclear or they are asking a general question.\nor simply they ask for appointment "
             }
           },
           {
@@ -125,7 +126,7 @@
       {
         "instruction": {
           "type": "prompt",
-          "text": "Understand what the caller needs.\n\nAsk: 'Of course! Could you let me know what you are looking to book today?'\n\nListen carefully to their response:\n- If they want to book an appointment, say: 'Absolutely, I can help with that!' then transition to Negotiate_State. Reference today's date from the system if needed: {{current_date}} ({{day_of_week}}).\n- If they want to call back later or schedule a callback, transition to Callback_State.\n- If they are not interested or it is a wrong number, transition to Closing_State."
+          "text": "Understand what the caller needs.\n\nAsk: 'Of course! Are you looking to book an appointment with us today?'\n\nListen carefully to their response:\n- If they want to book any dealership-related appointment, say: 'Absolutely, I can help with that!' then transition to Negotiate_State.\n- If they want to call back later or schedule a callback, transition to Callback_State.\n- If the request is unrelated to the car dealership, say: 'I am sorry, this line is dedicated to car dealership bookings. Is there a dealership appointment I can help you with?'\n- If they are not interested or it is a wrong number, transition to Closing_State."
         },
         "model_choice": {
           "type": "cascading",
@@ -162,8 +163,8 @@
         "id": "node-purpose",
         "type": "conversation",
         "display_position": {
-          "x": 198,
-          "y": 726
+          "x": 246,
+          "y": 582
         }
       },
       {
@@ -197,7 +198,7 @@
       {
         "instruction": {
           "type": "prompt",
-          "text": "Today's reference date and time are already set by the system: {{current_date}} ({{iso_date}}), {{day_of_week}}, at {{current_time}} ({{timezone}}). Use these for all \"this week\" / \"tomorrow\" / relative date reasoning — never invent a calendar.\n\nAsk the caller: 'What date and time were you thinking? We have good availability this week.'\n\nListen to their response carefully.\n- If they propose a specific date and time, acknowledge it and check if it works.\n- If they are unsure, offer a couple of options based on the real current date above: 'We have availability on [day] at [time] or [day] at [time] — would either of those work?'\n- Use brief acknowledgments: Got it, Sure, That works.\n\nOnce a specific date AND time is proposed by the caller:\n- Repeat it back: 'So that would be [day], [date] at [time]. Let me just check availability for you.'\n- Transition to Check_Availability_State.\n\nIf no availability at all, transition to No_Availability_State."
+          "text": "Today's reference date and time are already set by the system: {{current_date}} ({{iso_date}}), {{day_of_week}}, at {{current_time}} ({{timezone}}). Use these for ALL date and time reasoning — never invent a calendar.\n\nPAST DATE / TIME VALIDATION (CRITICAL — check every single proposal):\n- Compare the caller's requested date against {{current_date}}.\n- If the requested date is in a past month (e.g. caller says 'March' but current month is April or later), it is in the past. Tell the caller: 'I am sorry, that date has already passed. Could you give me a date from today onward?'\n- If the requested date is today's date but the requested time is earlier than {{current_time}}, it is in the past. Tell the caller: 'That time has already passed for today. Could you give me a later time today, or a different day?'\n- If the requested date is before today in any way (past day, past month, past year), it is invalid. Always ask for a valid future date.\n- NEVER proceed to Check_Availability_State with a past date or time.\n\nAsk the caller: 'What date and time were you thinking? We have good availability this week.'\n\nListen to their response carefully.\n- If they propose a specific date and time, validate it is NOT in the past (see above).\n- If they give a past date or time, reject it politely and ask again.\n- If they are unsure, offer a couple of options based on the real current date above: 'We have availability on [day] at [time] or [day] at [time] — would either of those work?'\n- Use brief acknowledgments: Got it, Sure, That works.\n\nOnce a specific date AND time is proposed AND it is confirmed to be a valid future date/time:\n- Repeat it back: 'So that would be [day], [date] at [time]. Let me just check availability for you.'\n- Transition to Check_Availability_State.\n\nIf no availability at all, transition to No_Availability_State."
         },
         "model_choice": {
           "type": "cascading",
@@ -300,7 +301,7 @@
       {
         "instruction": {
           "type": "prompt",
-          "text": "Both sides have agreed on the date and time. Confirm the full details before booking.\n\nAsk: 'Perfect! Could I get your name and the best contact number for the booking?'\n\nListen and collect:\n- Name: capture from caller\n- Phone / email: capture from caller\n- Service / Reason: ask if not already stated — 'And what is this appointment for?'\n\nOnce all details are collected, confirm back:\n'Great, so I have [name] on [day, date] at [time] for [service]. Let me go ahead and get that booked for you.'\n\nThen transition to Book_Appointment_State."
+          "text": "Both sides have agreed on the date and time. Now collect all required details before booking.\n\nStep 1 — Ask the appointment purpose FIRST:\n'And what will this appointment be for — for example a test drive, a service, an inspection, a finance consultation, or something else?'\nListen and note the appointment type/reason.\n\nStep 2 — Collect contact details:\n'Perfect! Could I also get your name and a contact number for the booking?'\nListen and collect:\n- Name: capture from caller\n- Phone / email: capture from caller (optional but ask)\n\nStep 3 — Confirm everything back before booking:\n'Great, so I have [name] down for a [appointment type] on [day, date] at [time]. Let me go ahead and get that confirmed for you.'\n\nThen transition to Book_Appointment_State."
         },
         "model_choice": {
           "type": "cascading",
@@ -314,7 +315,7 @@
             "id": "edge-confirm-to-book",
             "transition_condition": {
               "type": "prompt",
-              "prompt": "All details confirmed. Call book_appointment with user_id exactly {{user_id}}, appointment_date/start_time as agreed, attendee_name from caller, title = service/reason (e.g. Test drive). organizer_name optional — use {{business_name}} if no staff name."
+              "prompt": "All details confirmed. Call book_appointment tool now."
             }
           }
         ],
@@ -359,7 +360,7 @@
       {
         "instruction": {
           "type": "prompt",
-          "text": "The book_appointment tool just returned. Check the 'success' field:\n\nIf success=true:\n- Say: 'You are all booked in! I have confirmed your appointment for [date] at [time]. You will receive a confirmation shortly.'\n- Transition to Booking_Confirmation_State.\n\nIf success=false or an error occurred:\n- Say: 'I am having a small issue on my end right now. Could you give me just one moment?'\n- Call the tool one more time as a retry.\n- If it fails again, say: 'I apologise for the inconvenience — our team will follow up shortly to confirm this in writing.'\n- Transition to Closing_State."
+          "text": "The book_appointment tool just returned. Check the 'success' field:\n\nIf success=true:\n- Say: 'You are all booked in! I have confirmed your [appointment type] for [date] at [time]. You will receive a confirmation shortly.'\n- Transition to Booking_Confirmation_State.\n\nIf success=false or an error occurred:\n- Say: 'I am having a small issue on my end — just one moment please.'\n- Call the tool one more time as a retry.\n- If it fails again, say: 'I apologise for the inconvenience. Our team will follow up with you shortly to confirm the booking.'\n- Do NOT ask any further questions after the apology.\n- Transition immediately to Closing_State."
         },
         "model_choice": {
           "type": "cascading",
@@ -470,7 +471,7 @@
       {
         "instruction": {
           "type": "prompt",
-          "text": "Wrap up the call warmly and professionally.\n\n1. If booking was successful: 'Wonderful! We look forward to seeing you then. Have a great day!'\n2. If no booking or callback requested: 'Thank you so much for calling. Do not hesitate to reach out if you need anything else. Have a wonderful day!'\n3. If misdial or no help needed: 'No problem at all — take care and have a great day!'\n\nThen transition to Report_Event_State to log the call outcome."
+          "text": "Wrap up the call warmly and professionally. Say EXACTLY one of the following lines based on outcome — then stop speaking immediately and transition to End Call. Do NOT ask any follow-up questions or keep the line open.\n\n1. Booking successful: 'Wonderful! We look forward to seeing you at the dealership — have a great day, goodbye!'\n2. Callback noted: 'Perfect, we will be in touch. Have a wonderful day, goodbye!'\n3. No booking or wrong number: 'Thank you so much for calling {{business_name}} — take care, goodbye!'\n4. Booking failed after retry: 'Thank you for your patience — our team will follow up shortly. Have a great day, goodbye!'\n\nAfter saying goodbye, end the call immediately."
         },
         "model_choice": {
           "type": "cascading",
@@ -480,7 +481,7 @@
         "name": "Closing_State",
         "edges": [
           {
-            "destination_node_id": "node-report-event",
+            "destination_node_id": "end-call-node",
             "id": "edge-closing-to-report",
             "transition_condition": {
               "type": "prompt",
@@ -496,47 +497,16 @@
         }
       },
       {
-        "tool_id": "tool-report-event",
-        "else_edge": {
-          "destination_node_id": "end-call-node",
-          "id": "node-report-event-else-edge",
-          "transition_condition": {
-            "type": "prompt",
-            "prompt": "Else"
-          }
-        },
-        "name": "Report_Event",
-        "edges": [
-          {
-            "destination_node_id": "end-call-node",
-            "id": "edge-report-to-end",
-            "transition_condition": {
-              "type": "prompt",
-              "prompt": "report_event tool completed."
-            }
-          }
-        ],
-        "id": "node-report-event",
-        "type": "function",
-        "tool_type": "local",
-        "speak_during_execution": false,
-        "display_position": {
-          "x": 3750,
-          "y": -90
-        },
-        "wait_for_result": true
-      },
-      {
         "name": "End Call",
         "id": "end-call-node",
         "type": "end",
         "display_position": {
-          "x": 4590,
-          "y": 462
+          "x": 5118,
+          "y": 1278
         },
         "instruction": {
           "type": "prompt",
-          "text": "End the call gracefully."
+          "text": "The call has ended. Hang up immediately. Do not speak."
         }
       }
     ],
@@ -557,9 +527,9 @@
         "name": "check_availability",
         "response_variables": {
           "available": "$.available",
-          "message": "$.message",
           "conflict_details": "$.conflict_details",
-          "warning": "$.warning"
+          "warning": "$.warning",
+          "message": "$.message"
         },
         "parameters": {
           "type": "object",
@@ -583,7 +553,7 @@
             },
             "user_id": {
               "type": "string",
-              "description": "MUST be {{user_id}} from inbound webhook (string)."
+              "description": "Business user ID from {{user_id}}. If {{user_id}} is 0 or empty, omit this field — the backend resolves it automatically."
             }
           }
         }
@@ -593,7 +563,7 @@
         "parameter_type": "json",
         "method": "POST",
         "query_params": {},
-        "description": "Books the confirmed visit/appointment. REQUIRED: user_id MUST be exactly the inbound dynamic variable {{user_id}} (same string Retell injected). organizer_name: use {{business_name}} if you did not collect a staff name. title: short reason (e.g. Test drive, Promotion follow-up, Service).",
+        "description": "Books the confirmed appointment for the caller. Call this only AFTER the caller has verbally confirmed the date, time, and their details AND availability has been verified as true.",
         "type": "custom",
         "url": "http://13.62.92.163:8000/api/agent/book-appointment",
         "tool_id": "tool-book-appointment",
@@ -601,60 +571,59 @@
         "timeout_ms": 15000,
         "name": "book_appointment",
         "response_variables": {
-          "message": "$.message",
           "appointment_id": "$.appointment_id",
-          "success": "$.success",
-          "email_sent": "$.email_sent"
+          "email_sent": "$.email_sent",
+          "message": "$.message",
+          "success": "$.success"
         },
         "parameters": {
           "type": "object",
           "required": [
-            "user_id",
             "appointment_date",
             "start_time",
             "attendee_name",
             "title"
           ],
           "properties": {
-            "start_time": {
-              "type": "string",
-              "description": "Confirmed start time in HH:MM 24-hour format. Example: 14:00."
-            },
-            "notes": {
-              "type": "string",
-              "description": "Any special instructions or notes discussed during the call."
-            },
             "user_id": {
               "type": "string",
-              "description": "MUST match inbound webhook {{user_id}} exactly (string). Do not use placeholder numbers."
-            },
-            "organizer_email": {
-              "type": "string",
-              "description": "Email of the caller if provided during the call."
-            },
-            "end_time": {
-              "type": "string",
-              "description": "End time in HH:MM 24-hour format. Default to 1 hour after start_time if not provided."
+              "description": "Business user ID from {{user_id}}. If {{user_id}} is 0 or empty, omit this field — the backend resolves it automatically."
             },
             "appointment_date": {
               "type": "string",
               "description": "Confirmed appointment date in YYYY-MM-DD format. Example: 2025-10-30."
             },
+            "start_time": {
+              "type": "string",
+              "description": "Confirmed start time in HH:MM 24-hour format. Example: 14:00."
+            },
+            "end_time": {
+              "type": "string",
+              "description": "End time in HH:MM 24-hour format. Defaults to 1 hour after start_time if not provided."
+            },
             "attendee_name": {
               "type": "string",
-              "description": "Name of the caller / customer who is booking the appointment."
-            },
-            "description": {
-              "type": "string",
-              "description": "Appointment description. Use: Appointment booked via inbound call by SUMA."
-            },
-            "organizer_name": {
-              "type": "string",
-              "description": "Optional. If unknown, omit or use {{business_name}} (dealership name from inbound webhook)."
+              "description": "Full name of the caller / customer booking the appointment."
             },
             "title": {
               "type": "string",
-              "description": "Brief title: e.g. Test drive, New vehicle inquiry, Promotion callback, Service appointment."
+              "description": "Brief appointment title, e.g. Test Drive, Service, Inspection, Finance Consultation."
+            },
+            "organizer_name": {
+              "type": "string",
+              "description": "Optional. Dealership name — use {{business_name}} if known."
+            },
+            "organizer_email": {
+              "type": "string",
+              "description": "Caller email if provided. Pass empty string if not collected."
+            },
+            "notes": {
+              "type": "string",
+              "description": "Any special notes or instructions discussed during the call."
+            },
+            "description": {
+              "type": "string",
+              "description": "Appointment description. Default: Appointment booked via inbound call by SUMA."
             }
           }
         }
@@ -695,7 +664,7 @@
             },
             "user_id": {
               "type": "string",
-              "description": "MUST be {{user_id}} from inbound webhook (string)."
+              "description": "Business user ID from {{user_id}}. If {{user_id}} is 0 or empty, omit this field."
             },
             "organizer_email": {
               "type": "string",
@@ -749,7 +718,7 @@
             },
             "user_id": {
               "type": "string",
-              "description": "MUST be {{user_id}} from inbound webhook (string)."
+              "description": "Business user ID from {{user_id}}. If {{user_id}} is 0 or empty, omit this field."
             },
             "call_id": {
               "type": "string",

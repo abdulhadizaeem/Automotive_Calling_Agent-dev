@@ -133,10 +133,17 @@ def resolve_user_from_call(call: dict[str, Any]) -> Optional[int]:
 
 
 def resolve_agent_tool_user_id(raw: Any) -> Optional[int]:
-    """Prefer tool JSON user_id; if missing or invalid, use RETELL_DEFAULT_INBOUND_USER_ID."""
-    if raw is not None and str(raw).strip() != "":
+    """
+    Prefer tool JSON user_id; fall back to RETELL_DEFAULT_INBOUND_USER_ID.
+    Treats 0 / negative / empty-string / None as "not provided" — Retell injects
+    the literal integer 0 when {{user_id}} has no real value (e.g. test calls from
+    the Retell dashboard where the inbound webhook hasn't fired).
+    """
+    if raw is not None and str(raw).strip() not in ("", "0", "null", "none"):
         try:
-            return int(raw)
+            v = int(raw)
+            if v > 0:
+                return v
         except (TypeError, ValueError):
             pass
     return default_retell_user_id_from_env()
