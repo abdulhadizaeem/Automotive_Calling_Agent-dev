@@ -297,6 +297,12 @@ async def agent_get_current_datetime():
     )
 
 
+# Backward-compat: your Retell tool config currently uses POST for get_current_datetime.
+@router.post("/agent/get-current-datetime")
+async def agent_get_current_datetime_post():
+    return await agent_get_current_datetime()
+
+
 class CheckAvailabilityRequest(BaseModel):
     user_id: int
     appointment_date: str  # YYYY-MM-DD
@@ -835,8 +841,18 @@ async def book_appointment(request: Request):
         organizer_name = data.get("organizer_name")
         organizer_email = data.get("organizer_email")
         
-        if not all([user_id, appointment_date, start_time, end_time, organizer_email]):
+        if not all([user_id, appointment_date, start_time, end_time, organizer_name]):
             return error_response("Missing required fields", status_code=400)
+
+        # If caller didn't provide email, fall back to the business user's email.
+        # This prevents production failures (appointments.attendee_email is NOT NULL).
+        attendee_email = organizer_email
+        if not attendee_email:
+            try:
+                u = db.get_user_by_id(int(user_id))
+                attendee_email = (u.get("email") if isinstance(u, dict) else None) or "no-reply@example.com"
+            except Exception:
+                attendee_email = "no-reply@example.com"
         
         # ✅ REMOVED: Conflict checking
         # Just book directly
@@ -847,23 +863,25 @@ async def book_appointment(request: Request):
             start_time=start_time,
             end_time=end_time,
             attendee_name=attendee_name,
-            attendee_email=organizer_email,
+            attendee_email=attendee_email,
             title=title,
             description=description
         )
         
-        # Send calendar invite email
-        email_sent = await mail_obj.send_email_with_calendar_event(
-            attendee_email=organizer_email,
-            attendee_name=organizer_name,
-            appointment_date=appointment_date,
-            start_time=start_time,
-            end_time=end_time,
-            title=title,
-            description=description,
-            organizer_name=organizer_name,
-            organizer_email=organizer_email
-        )
+        # Send calendar invite email only if caller email was provided.
+        email_sent = False
+        if organizer_email:
+            email_sent = await mail_obj.send_email_with_calendar_event(
+                attendee_email=organizer_email,
+                attendee_name=organizer_name,
+                appointment_date=appointment_date,
+                start_time=start_time,
+                end_time=end_time,
+                title=title,
+                description=description,
+                organizer_name=organizer_name,
+                organizer_email=organizer_email
+            )
         
         logging.info(f"✅ Appointment booked successfully: {appointment_id}")
         
@@ -871,7 +889,7 @@ async def book_appointment(request: Request):
             "success": True,
             "appointment_id": appointment_id,
             "email_sent": email_sent,
-            "message": "Appointment booked successfully"
+            "message": "Appointment booked successfully" + ("" if organizer_email else " (no email provided)")
         })
         
     except Exception as e:
@@ -976,7 +994,8 @@ async def receive_agent_event(request: Request):
         
         db.update_call_history(call_id, updates)
         
-        return JSONResponse({"success": True})
+        # Retell tool expects acknowledged=true (see agent.json response_variables)
+        return JSONResponse({"success": True, "acknowledged": True})
         
     except Exception as e:
         logging.error(f"report-event error: {e}")
