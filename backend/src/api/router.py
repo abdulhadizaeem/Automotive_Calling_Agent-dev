@@ -39,7 +39,6 @@ from src.utils.mail_management import Send_Mail
 from src.utils.jwt_utils import create_access_token
 from src.utils.utils import get_current_user, calculate_duration
 from src.utils.retell_utils import (
-    verify_retell_signature,
     apply_retell_webhook_event,
     resolve_inbound_user_id,
     retell_get_call,
@@ -204,9 +203,6 @@ async def assistant_initiate_call(payload: Assistant_Payload, user=Depends(get_c
 async def retell_webhook(request: Request):
     """Retell account/agent webhook: call_started, transcript_updated, call_ended, call_analyzed, transfers."""
     raw_body = (await request.body()).decode("utf-8")
-    sig = request.headers.get("X-Retell-Signature") or request.headers.get("x-retell-signature")
-    if not verify_retell_signature(raw_body, sig):
-        return JSONResponse(status_code=401, content={"message": "Unauthorized"})
     try:
         data = json.loads(raw_body)
     except json.JSONDecodeError:
@@ -228,9 +224,6 @@ async def retell_inbound_webhook(request: Request):
     Configure this URL in Retell for your inbound number.
     """
     raw_body = (await request.body()).decode("utf-8")
-    sig = request.headers.get("X-Retell-Signature") or request.headers.get("x-retell-signature")
-    if not verify_retell_signature(raw_body, sig):
-        return JSONResponse(status_code=401, content={"message": "Unauthorized"})
     try:
         data = json.loads(raw_body)
     except json.JSONDecodeError:
