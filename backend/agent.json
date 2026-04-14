@@ -314,7 +314,7 @@
             "id": "edge-confirm-to-book",
             "transition_condition": {
               "type": "prompt",
-              "prompt": "All details confirmed. Call book_appointment tool now."
+              "prompt": "All details confirmed. Call book_appointment with user_id exactly {{user_id}}, appointment_date/start_time as agreed, attendee_name from caller, title = service/reason (e.g. Test drive). organizer_name optional — use {{business_name}} if no staff name."
             }
           }
         ],
@@ -582,8 +582,8 @@
               "description": "The proposed start time in HH:MM 24-hour format. Example: 14:00."
             },
             "user_id": {
-              "type": "integer",
-              "description": "The business user ID. Use value from dynamic variable {{user_id}}."
+              "type": "string",
+              "description": "MUST be {{user_id}} from inbound webhook (string)."
             }
           }
         }
@@ -593,14 +593,14 @@
         "parameter_type": "json",
         "method": "POST",
         "query_params": {},
-        "description": "Books the confirmed appointment for the caller. Call this only AFTER the caller has verbally confirmed the date, time, and their details AND availability has been verified as true.",
+        "description": "Books the confirmed visit/appointment. REQUIRED: user_id MUST be exactly the inbound dynamic variable {{user_id}} (same string Retell injected). organizer_name: use {{business_name}} if you did not collect a staff name. title: short reason (e.g. Test drive, Promotion follow-up, Service).",
         "type": "custom",
         "url": "http://13.62.92.163:8000/api/agent/book-appointment",
         "tool_id": "tool-book-appointment",
         "args_at_root": true,
         "timeout_ms": 15000,
         "name": "book_appointment",
-               "response_variables": {
+        "response_variables": {
           "message": "$.message",
           "appointment_id": "$.appointment_id",
           "success": "$.success",
@@ -613,8 +613,7 @@
             "appointment_date",
             "start_time",
             "attendee_name",
-            "title",
-            "organizer_name"
+            "title"
           ],
           "properties": {
             "start_time": {
@@ -626,8 +625,8 @@
               "description": "Any special instructions or notes discussed during the call."
             },
             "user_id": {
-              "type": "integer",
-              "description": "The business user ID. Use value from dynamic variable {{user_id}}."
+              "type": "string",
+              "description": "MUST match inbound webhook {{user_id}} exactly (string). Do not use placeholder numbers."
             },
             "organizer_email": {
               "type": "string",
@@ -651,11 +650,11 @@
             },
             "organizer_name": {
               "type": "string",
-              "description": "Name of the business or staff member hosting the appointment. Use value from dynamic variable {{business_name}}."
+              "description": "Optional. If unknown, omit or use {{business_name}} (dealership name from inbound webhook)."
             },
             "title": {
               "type": "string",
-              "description": "Brief title of the appointment. Example: Haircut, Dental Checkup, Consultation."
+              "description": "Brief title: e.g. Test drive, New vehicle inquiry, Promotion callback, Service appointment."
             }
           }
         }
@@ -695,8 +694,8 @@
               "description": "Any additional notes to include in the confirmation."
             },
             "user_id": {
-              "type": "integer",
-              "description": "The business user ID. Use value from dynamic variable {{user_id}}."
+              "type": "string",
+              "description": "MUST be {{user_id}} from inbound webhook (string)."
             },
             "organizer_email": {
               "type": "string",
@@ -749,8 +748,8 @@
               "description": "Any extra notes about the call outcome."
             },
             "user_id": {
-              "type": "integer",
-              "description": "The business user ID. Use value from dynamic variable {{user_id}}."
+              "type": "string",
+              "description": "MUST be {{user_id}} from inbound webhook (string)."
             },
             "call_id": {
               "type": "string",

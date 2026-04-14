@@ -967,7 +967,7 @@ async def book_appointment(request: Request):
         attendee_name = data.get("attendee_name", "Valued Customer")
         title = data.get("title", "Appointment")
         description = data.get("description", "")
-        organizer_name = data.get("organizer_name")
+        organizer_name = (data.get("organizer_name") or "").strip()
         organizer_email = data.get("organizer_email")
 
         try:
@@ -975,8 +975,12 @@ async def book_appointment(request: Request):
         except (TypeError, ValueError):
             return error_response("Invalid or missing user_id", status_code=400)
 
-        if not all([appointment_date, start_time, organizer_name]):
+        if not all([appointment_date, start_time]):
             return error_response("Missing required fields", status_code=400)
+
+        # Tool callers sometimes omit organizer_name; default safely for inbound dealership use.
+        if not organizer_name:
+            organizer_name = "Dealership"
 
         if not end_time:
             try:
