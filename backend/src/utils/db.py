@@ -993,6 +993,8 @@ Tone: Professional and friendly"""
                     SELECT ch.id, ch.call_id, ch.status, ch.duration, ch.transcript,
                         ch.summary, ch.recording_url, ch.created_at, ch.started_at, ch.ended_at,
                         ch.voice_id, ch.voice_name, ch.from_number, ch.to_number,
+                        ch.transcript_url, ch.transcript_blob, ch.recording_blob,
+                        ch.events_log, ch.agent_events,
                         u.id AS user_id, u.username, u.email
                     FROM call_history ch
                     JOIN users u ON ch.user_id = u.id
@@ -1010,6 +1012,12 @@ Tone: Professional and friendly"""
                             row["transcript"] = json.loads(row["transcript"])
                         except Exception:
                             logging.warning(f"Invalid JSON in transcript for call_id={row['call_id']}")
+                    for key in ("events_log", "agent_events"):
+                        if isinstance(row.get(key), str):
+                            try:
+                                row[key] = json.loads(row[key])
+                            except Exception:
+                                row[key] = []
 
                 return {
                     "calls": rows,

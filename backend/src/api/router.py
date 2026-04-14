@@ -37,7 +37,7 @@ from src.models.System_Prompt import SystemPromptBuilder
 from src.utils.db import PGDB 
 from src.utils.mail_management import Send_Mail
 from src.utils.jwt_utils import create_access_token
-from src.utils.utils import get_current_user,add_call_event,fetch_and_store_transcript,fetch_and_store_recording, calculate_duration, check_if_answered
+from src.utils.utils import get_current_user, calculate_duration
 from src.utils.retell_utils import (
     verify_retell_signature,
     apply_retell_webhook_event,
@@ -535,96 +535,10 @@ async def agent_send_confirmation(body: SendConfirmationRequest):
 
 @router.post("/livekit-webhook")
 async def livekit_webhook(request: Request):
-    try:
-        data = await request.json()
-        event = data.get("event")
-        room = data.get("room", {})
-        call_id = room.get("name")
-
-        # ✅ Extract call_id from egress events
-        if not call_id:
-            egress_info = data.get("egress_info", {}) or data.get("egressInfo", {})
-            call_id = egress_info.get("room_name") or egress_info.get("roomName")
-            if not call_id:
-                return JSONResponse({"message": "No call_id"})
-
-        # ✅ Always log event
-        add_call_event(call_id, event, data)
-        
-        # ✅ Ignore non-critical events
-        if event in ["room_started", "participant_joined", "egress_started", 
-                     "egress_updated", "track_published", "track_unpublished"]:
-            return JSONResponse({"message": f"{event} logged"})
-
-        # ✅ Handle room end
-        if event in ["room_finished", "participant_left"]:
-            await asyncio.sleep(0.5)
-            
-            conn = db.get_connection()
-            try:
-                with conn.cursor() as cursor:
-                    cursor.execute("""
-                        SELECT status, events_log, started_at, created_at
-                        FROM call_history WHERE call_id = %s
-                    """, (call_id,))
-                    row = cursor.fetchone()
-            finally:
-                db.release_connection(conn)  # ✅ FIXED: Changed from conn.close()
-
-            if not row:
-                return JSONResponse({"message": "Call not found"})
-
-            current_status, events_log, db_started_at, created_at = row
-            
-            # ✅ Skip if already final
-            if current_status in {"completed", "unanswered"}:
-                # Just update duration
-                started = db_started_at or created_at
-                ended = datetime.now(timezone.utc)
-                duration = (ended - started).total_seconds() if started else 0
-                
-                db.update_call_history(call_id, {
-                    "duration": max(0, duration),
-                    "ended_at": ended
-                })
-                return JSONResponse({"message": "Duration updated"})
-
-            # ✅ Determine final status
-            answered = check_if_answered(events_log)
-            final_status = "completed" if answered else "unanswered"
-            
-            started = db_started_at or created_at
-            ended = datetime.now(timezone.utc)
-            duration = (ended - started).total_seconds() if (answered and started) else 0
-
-            db.update_call_history(call_id, {
-                "status": final_status,
-                "duration": max(0, duration),
-                "ended_at": ended,
-                "started_at": started
-            })
-            
-            return JSONResponse({"message": f"Call ended: {final_status}"})
-
-        # ✅ Handle recording
-        elif event == "egress_ended":
-            egress_info = data.get("egress_info", {}) or data.get("egressInfo", {})
-            file_results = egress_info.get("file_results", []) or egress_info.get("fileResults", [])
-            
-            if file_results:
-                file_info = file_results[0] if isinstance(file_results, list) else file_results
-                location = file_info.get("location") or file_info.get("download_url")
-                
-                if location:
-                    db.update_call_history(call_id, {"recording_url": location})
-                    return JSONResponse({"message": "Recording saved"})
-
-        return JSONResponse({"message": f"{event} processed"})
-
-    except Exception as e:
-        logging.error(f"Webhook error: {e}")
-        traceback.print_exc()  # ✅ Added for better debugging
-        return JSONResponse({"error": str(e)}, status_code=500)
+    raise HTTPException(
+        status_code=410,
+        detail="LiveKit webhooks removed (Retell is now the calling provider). Use /api/retell-webhook.",
+    )
 
 
 
@@ -633,8 +547,10 @@ async def livekit_webhook(request: Request):
 
 @router.post("/livekit-egress-webhook")
 async def livekit_egress_webhook(request: Request):
-    """Alias endpoint for egress-specific webhooks"""
-    return await livekit_webhook(request)
+    raise HTTPException(
+        status_code=410,
+        detail="LiveKit egress webhooks removed (Retell is now the calling provider).",
+    )
 
 
 # @router.get("/call-history")
@@ -841,6 +757,28 @@ async def get_user_call_history(
             
             # ✅ FIX 3: Add recording availability flag
             call_data["has_recording"] = bool(call.get("recording_url") or call.get("recording_blob_data"))
+
+            # ---- Reference-style fields (additive; keeps existing keys intact) ----
+            call_data["call_status"] = call_data.get("status")
+            call_data["caller_phone"] = call_data.get("from_number")
+            call_data["agent_phone"] = call_data.get("to_number")
+            call_data["direction"] = "inbound"  # current system is inbound-first
+            call_data["call_summary"] = call_data.get("summary")
+            if call_data.get("duration") is not None:
+                try:
+                    call_data["duration_ms"] = int(float(call_data["duration"]) * 1000)
+                except Exception:
+                    call_data["duration_ms"] = None
+            else:
+                call_data["duration_ms"] = None
+            try:
+                sa = call.get("started_at")
+                ea = call.get("ended_at")
+                call_data["start_timestamp"] = int(sa.timestamp() * 1000) if sa else None
+                call_data["end_timestamp"] = int(ea.timestamp() * 1000) if ea else None
+            except Exception:
+                call_data["start_timestamp"] = None
+                call_data["end_timestamp"] = None
             
             calls.append(call_data)
 
@@ -865,6 +803,63 @@ async def get_user_call_history(
         logging.error(f"Error fetching history: {e}")
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/call-history/{call_id}")
+async def get_call_history_item(call_id: str, user=Depends(get_current_user)):
+    """
+    History detail (per call id). Includes Retell webhook trail (events_log / agent_events).
+    Shape is additive and compatible with reference-style fields.
+    """
+    row = db.get_call_dashboard_detail(call_id, user["id"])
+    if not row:
+        raise HTTPException(status_code=404, detail="Call not found")
+
+    # Reference-style aliases
+    row["call_status"] = row.get("status")
+    row["caller_phone"] = row.get("from_number")
+    row["agent_phone"] = row.get("to_number")
+    row["direction"] = "inbound"
+    row["call_summary"] = row.get("summary")
+    if row.get("duration") is not None:
+        try:
+            row["duration_ms"] = int(float(row["duration"]) * 1000)
+        except Exception:
+            row["duration_ms"] = None
+    else:
+        row["duration_ms"] = None
+    try:
+        sa = row.get("started_at")
+        ea = row.get("ended_at")
+        row["start_timestamp"] = int(sa.timestamp() * 1000) if sa else None
+        row["end_timestamp"] = int(ea.timestamp() * 1000) if ea else None
+    except Exception:
+        row["start_timestamp"] = None
+        row["end_timestamp"] = None
+
+    # Human-friendly transcript text
+    transcript_text = None
+    tr = row.get("transcript")
+    try:
+        if isinstance(tr, str):
+            tr = json.loads(tr)
+        if isinstance(tr, list):
+            lines = []
+            for msg in tr:
+                if isinstance(msg, dict) and msg.get("type") == "message":
+                    speaker = "Assistant" if msg.get("role") == "assistant" else "User"
+                    text = " ".join(msg.get("content", [])) if isinstance(msg.get("content"), list) else str(msg.get("content"))
+                    lines.append(f"{speaker}: {text}")
+            transcript_text = "\n".join(lines)
+        elif isinstance(tr, dict):
+            # retell transcript payload wrapper (we keep raw; text extraction best-effort)
+            transcript_text = None
+    except Exception:
+        transcript_text = None
+    row["transcript_text"] = transcript_text
+    row["has_recording"] = bool(row.get("recording_url") or row.get("recording_blob_data"))
+
+    return JSONResponse(content=jsonable_encoder(row))
 
 
 @router.get("/agent/get-appointments/{user_id}")
@@ -1022,42 +1017,10 @@ async def book_appointment(request: Request):
 
 @router.post("/agent/save-call-data")
 async def save_call_data(request: Request):
-    try:
-        data = await request.json()
-        
-        call_id = data.get("call_id")
-        transcript_blob = data.get("transcript_blob")
-        recording_blob = data.get("recording_blob")
-        
-        # Save metadata
-        updates = {
-            "transcript_blob": transcript_blob,
-            "recording_blob": recording_blob
-        }
-        
-        db.update_call_history(call_id, updates)
-        
-        # ✅ DELAYED transcript (5s)
-        if transcript_blob:
-            async def delayed_transcript():
-                await asyncio.sleep(5)
-                logging.info(f"📄 Downloading transcript for {call_id}")
-                await fetch_and_store_transcript(call_id, None, transcript_blob)
-            asyncio.create_task(delayed_transcript())
-        
-        # ✅ DELAYED recording (15s)
-        if recording_blob:
-            async def delayed_recording():
-                await asyncio.sleep(15)
-                logging.info(f"🎵 Downloading recording for {call_id}")
-                await fetch_and_store_recording(call_id, None, recording_blob)
-            asyncio.create_task(delayed_recording())
-        
-        return JSONResponse({"success": True})
-        
-    except Exception as e:
-        logging.error(f"❌ save_call_data error: {e}")
-        return JSONResponse({"error": str(e)}, status_code=500)
+    raise HTTPException(
+        status_code=410,
+        detail="save-call-data removed (Retell webhooks persist transcript/recording_url).",
+    )
     
 
 
@@ -1223,14 +1186,9 @@ async def reset_prompt_customization(user=Depends(get_current_user)):
 
 @router.options("/calls/{call_id}/recording/stream")
 async def stream_call_recording_options(call_id: str):
-    return Response(
-        status_code=200,
-        headers={
-            "Access-Control-Allow-Origin": "*",  # Or specific domain
-            "Access-Control-Allow-Methods": "GET, OPTIONS",
-            "Access-Control-Allow-Headers": "Range, Content-Type, Authorization, Accept",
-            "Access-Control-Max-Age": "3600"
-        }
+    raise HTTPException(
+        status_code=410,
+        detail="Recording streaming removed. Use call_history.recording_url from /api/call-history.",
     )
 
 @router.get("/calls/{call_id}/recording/stream")
@@ -1239,64 +1197,10 @@ async def stream_call_recording(
     user=Depends(get_current_user),
     request: Request = None
 ):
-    try:
-        recording_data, content_type, size = db.get_recording_blob(call_id, user["id"])
-        
-        if recording_data:
-            logging.info(f"✅ Streaming {size} bytes for {call_id}")
-            
-            cors_headers = {
-                "Access-Control-Allow-Origin": "*",
-                "Access-Control-Allow-Methods": "GET, OPTIONS",
-                "Access-Control-Allow-Headers": "Range, Content-Type, Authorization",
-                "Access-Control-Expose-Headers": "Content-Range, Content-Length, Accept-Ranges",
-            }
-            
-            range_header = request.headers.get("range") if request else None
-            
-            if range_header:
-                try:
-                    range_match = range_header.replace("bytes=", "").split("-")
-                    start = int(range_match[0]) if range_match[0] else 0
-                    end = int(range_match[1]) if len(range_match) > 1 and range_match[1].strip() else size - 1
-                    
-                    # Ensure valid range
-                    start = max(0, start)
-                    end = min(end, size - 1)
-                    
-                    chunk = recording_data[start:end + 1]
-                    
-                    return Response(
-                        content=chunk,
-                        status_code=206,
-                        media_type=content_type or "audio/ogg",
-                        headers={
-                            **cors_headers,
-                            "Content-Range": f"bytes {start}-{end}/{size}",
-                            "Content-Length": str(len(chunk)),
-                            "Accept-Ranges": "bytes",
-                        }
-                    )
-                except Exception as e:
-                    logging.warning(f"Range parse failed: {e}")
-            
-            # Full file stream
-            return StreamingResponse(
-                io.BytesIO(recording_data),
-                media_type=content_type or "audio/ogg",
-                headers={
-                    **cors_headers,
-                    "Content-Length": str(size),
-                    "Accept-Ranges": "bytes",
-                }
-            )
-        
-        # URL fallback...
-        raise HTTPException(status_code=404, detail="Recording not found")
-        
-    except Exception as e:
-        logging.error(f"❌ Error: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+    raise HTTPException(
+        status_code=410,
+        detail="Recording streaming removed. Use call_history.recording_url from /api/call-history.",
+    )
     
 
 @router.get("/calls/{call_id}/transcript")
