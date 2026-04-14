@@ -38,6 +38,7 @@ class PGDB:
         self.create_appointments_table()
         self.create_user_prompts_table()
         self.create_retell_webhook_dedupe_table()
+        self.create_inbound_call_settings_table()
 
     def get_connection(self):
         """Get connection from pool"""
@@ -202,6 +203,33 @@ class PGDB:
             logging.info("✅ retell_webhook_dedupe table ready")
         except Exception as e:
             logging.error(f"Error creating retell_webhook_dedupe: {e}")
+            conn.rollback()
+        finally:
+            self.release_connection(conn)
+
+    def create_inbound_call_settings_table(self):
+        """
+        Stores per-user inbound configuration needed to populate Retell dynamic variables
+        (business_name, call_context, agent_name).
+        """
+        conn = self.get_connection()
+        try:
+            with conn.cursor() as cursor:
+                cursor.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS inbound_call_settings (
+                        user_id INTEGER PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+                        business_name TEXT,
+                        call_context TEXT,
+                        agent_name TEXT,
+                        updated_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
+                    );
+                    """
+                )
+            conn.commit()
+            logging.info("✅ inbound_call_settings table ready")
+        except Exception as e:
+            logging.error(f"Error creating inbound_call_settings: {e}")
             conn.rollback()
         finally:
             self.release_connection(conn)
@@ -1054,6 +1082,56 @@ Tone: Professional and friendly"""
         except Exception as e:
             conn.rollback()
             logging.error(f"record_retell_webhook_event: {e}")
+        finally:
+            self.release_connection(conn)
+
+    def upsert_inbound_call_settings(
+        self,
+        user_id: int,
+        business_name: str | None = None,
+        call_context: str | None = None,
+        agent_name: str | None = None,
+    ):
+        conn = self.get_connection()
+        try:
+            with conn.cursor(cursor_factory=RealDictCursor) as cursor:
+                cursor.execute(
+                    """
+                    INSERT INTO inbound_call_settings (user_id, business_name, call_context, agent_name, updated_at)
+                    VALUES (%s, %s, %s, %s, CURRENT_TIMESTAMP)
+                    ON CONFLICT (user_id)
+                    DO UPDATE SET
+                        business_name = EXCLUDED.business_name,
+                        call_context = EXCLUDED.call_context,
+                        agent_name = EXCLUDED.agent_name,
+                        updated_at = CURRENT_TIMESTAMP
+                    RETURNING user_id, business_name, call_context, agent_name, updated_at;
+                    """,
+                    (user_id, business_name, call_context, agent_name),
+                )
+                row = cursor.fetchone()
+            conn.commit()
+            return row
+        except Exception as e:
+            conn.rollback()
+            logging.error(f"upsert_inbound_call_settings error: {e}")
+            raise
+        finally:
+            self.release_connection(conn)
+
+    def get_inbound_call_settings(self, user_id: int) -> dict | None:
+        conn = self.get_connection()
+        try:
+            with conn.cursor(cursor_factory=RealDictCursor) as cursor:
+                cursor.execute(
+                    """
+                    SELECT user_id, business_name, call_context, agent_name, updated_at
+                    FROM inbound_call_settings
+                    WHERE user_id = %s
+                    """,
+                    (user_id,),
+                )
+                return cursor.fetchone()
         finally:
             self.release_connection(conn)
 

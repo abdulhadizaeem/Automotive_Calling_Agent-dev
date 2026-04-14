@@ -24,6 +24,7 @@ from fastapi.responses import JSONResponse,StreamingResponse
 from fastapi.security import OAuth2PasswordRequestForm
 from fastapi import HTTPException, Response
 from rich import print
+from pydantic import BaseModel
 from src.api.base_models import (
     UserLogin,
     UserRegister,
@@ -160,6 +161,19 @@ async def assistant_initiate_call(payload: Assistant_Payload, user=Depends(get_c
         complete_system_prompt = prompt_builder.generate_complete_prompt()
         logging.info("Prepared system prompt (%s chars) for user %s", len(complete_system_prompt), user["id"])
 
+        # Store inbound settings so Retell inbound webhook can populate dynamic variables used by your Conversation Flow.
+        business_name = (payload.caller_name or "").strip() or None
+        agent_name = "SUMA"
+        try:
+            db.upsert_inbound_call_settings(
+                user_id=user["id"],
+                business_name=business_name,
+                call_context=(payload.context or "").strip() or None,
+                agent_name=agent_name,
+            )
+        except Exception as e:
+            logging.warning("Failed to store inbound_call_settings for user %s: %s", user["id"], e)
+
         inbound_number = (
             os.getenv("RETELL_INBOUND_NUMBER")
             or os.getenv("RETELL_PUBLIC_INBOUND_NUMBER")
@@ -235,7 +249,18 @@ async def retell_inbound_webhook(request: Request):
     if ver.isdigit():
         body["call_inbound"]["override_agent_version"] = int(ver)
     if user_id is not None:
-        dv = {"user_id": str(user_id)}
+        settings = None
+        try:
+            settings = db.get_inbound_call_settings(user_id)
+        except Exception:
+            settings = None
+
+        dv = {
+            "user_id": str(user_id),
+            "agent_name": (settings or {}).get("agent_name") or "SUMA",
+            "business_name": (settings or {}).get("business_name") or "our business",
+            "call_context": (settings or {}).get("call_context") or "",
+        }
         # Response engine: dynamic_variables (general) + retell_llm_dynamic_variables (Retell LLM)
         body["call_inbound"]["dynamic_variables"] = dv
         body["call_inbound"]["retell_llm_dynamic_variables"] = dv
@@ -257,6 +282,140 @@ async def retell_health():
             "default_inbound_user_configured": bool(os.getenv("RETELL_DEFAULT_INBOUND_USER_ID")),
         },
     )
+
+@router.get("/agent/get-current-datetime")
+async def agent_get_current_datetime():
+    now = datetime.now(timezone.utc)
+    return JSONResponse(
+        {
+            "current_date": now.strftime("%Y-%m-%d"),
+            "iso_date": now.date().isoformat(),
+            "current_time": now.strftime("%H:%M"),
+            "day_of_week": now.strftime("%A"),
+            "timezone": "UTC",
+        }
+    )
+
+
+class CheckAvailabilityRequest(BaseModel):
+    user_id: int
+    appointment_date: str  # YYYY-MM-DD
+    start_time: str  # HH:MM
+    end_time: str | None = None  # HH:MM
+
+
+@router.post("/agent/check-availability")
+async def agent_check_availability(body: CheckAvailabilityRequest):
+    """
+    Checks for conflicts in the appointments table.
+    Returns {available: bool, message: str, conflict_details?: {...}}
+    """
+    try:
+        appt_date = body.appointment_date
+        start = body.start_time
+        end = body.end_time
+        if not end:
+            # default to 1h duration
+            start_dt = datetime.strptime(start, "%H:%M")
+            end = (start_dt + timedelta(hours=1)).strftime("%H:%M")
+
+        conn = db.get_connection()
+        try:
+            with conn.cursor() as cursor:
+                cursor.execute(
+                    """
+                    SELECT appointment_date, start_time, end_time, title, attendee_name
+                    FROM appointments
+                    WHERE user_id = %s
+                      AND appointment_date = %s
+                      AND status = 'scheduled'
+                      AND (start_time < %s::time AND end_time > %s::time)
+                    ORDER BY start_time
+                    LIMIT 1
+                    """,
+                    (body.user_id, appt_date, end, start),
+                )
+                row = cursor.fetchone()
+        finally:
+            db.release_connection(conn)
+
+        if row:
+            conflict_details = {
+                "appointment_date": str(row[0]),
+                "start_time": str(row[1]),
+                "end_time": str(row[2]),
+                "title": row[3],
+                "attendee_name": row[4],
+            }
+            return JSONResponse(
+                {
+                    "available": False,
+                    "message": "That time is already booked. Please pick another slot.",
+                    "conflict_details": conflict_details,
+                }
+            )
+
+        return JSONResponse(
+            {"available": True, "message": "That time is available. You can book it."}
+        )
+    except Exception as e:
+        logging.error("check-availability error: %s", e)
+        return JSONResponse(
+            status_code=200,
+            content={
+                "available": True,
+                "message": "I couldn't verify availability right now, but you can proceed with booking.",
+                "warning": str(e),
+            },
+        )
+
+
+class SendConfirmationRequest(BaseModel):
+    user_id: int
+    appointment_id: str
+    appointment_date: str
+    start_time: str
+    attendee_name: str
+    organizer_email: str
+    notes: str | None = None
+
+
+@router.post("/agent/send-confirmation")
+async def agent_send_confirmation(body: SendConfirmationRequest):
+    """
+    Sends a confirmation email. If email isn't available, returns sent=false.
+    """
+    try:
+        if not body.organizer_email:
+            return JSONResponse({"sent": False, "message": "No email provided"})
+
+        title = "Appointment Confirmation"
+        description = "Appointment booked via inbound call by SUMA."
+        end_time = None
+        try:
+            st = datetime.strptime(body.start_time, "%H:%M")
+            end_time = (st + timedelta(hours=1)).strftime("%H:%M")
+        except Exception:
+            end_time = body.start_time
+
+        sent = await mail_obj.send_email_with_calendar_event(
+            attendee_email=body.organizer_email,
+            attendee_name=body.attendee_name,
+            appointment_date=body.appointment_date,
+            start_time=body.start_time,
+            end_time=end_time,
+            title=title,
+            description=description,
+            organizer_name=body.attendee_name,
+            organizer_email=body.organizer_email,
+        )
+        return JSONResponse({"sent": bool(sent), "message": "Confirmation processed"})
+    except Exception as e:
+        logging.error("send-confirmation error: %s", e)
+        return JSONResponse(
+            status_code=200,
+            content={"sent": False, "message": "Failed to send confirmation", "error": str(e)},
+        )
 
 
 @router.post("/livekit-webhook")
@@ -776,14 +935,25 @@ async def receive_agent_event(request: Request):
         if not call_id or not status:
             return JSONResponse({"error": "Missing data"}, status_code=400)
         
-        if status not in {"initialized", "dialing", "connected", "unanswered"}:
+        # Retell flow may report end outcomes; keep backward compatibility with LiveKit statuses.
+        allowed = {
+            "initialized",
+            "dialing",
+            "connected",
+            "unanswered",
+            "completed",
+            "failed",
+            "no_availability",
+            "callback_requested",
+        }
+        if status not in allowed:
             return JSONResponse({"error": "Invalid status"}, status_code=400)
         
         # ✅ Build updates
         updates = {"status": status}
         now = datetime.now(timezone.utc)
         
-        # ✅ Set started_at on dialing or connected
+        # ✅ Set started_at on dialing/connected
         if status in {"dialing", "connected"}:
             conn = db.get_connection()
             try:
@@ -798,10 +968,11 @@ async def receive_agent_event(request: Request):
             finally:
                 conn.close()
         
-        # ✅ Handle unanswered
-        if status == "unanswered":
+        # ✅ Handle terminal states
+        if status in {"unanswered", "completed", "failed", "no_availability", "callback_requested"}:
             updates["ended_at"] = now
-            updates["duration"] = 0
+            if status in {"unanswered", "failed"}:
+                updates["duration"] = 0
         
         db.update_call_history(call_id, updates)
         
