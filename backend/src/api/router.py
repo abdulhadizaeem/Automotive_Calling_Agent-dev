@@ -357,6 +357,59 @@ async def dashboard_quick_stats(user=Depends(get_current_user)):
     return JSONResponse(db.get_dashboard_combined_stats(user["id"]))
 
 
+@router.get("/dashboard/appointments")
+async def dashboard_appointments(
+    page: int = Query(1, ge=1),
+    page_size: int = Query(50, ge=1, le=200),
+    from_date: str | None = Query(None, description="YYYY-MM-DD (defaults to today, UTC)"),
+    user=Depends(get_current_user),
+):
+    """
+    Single endpoint for the frontend:
+    returns totals + the list of appointments (each item includes all details needed for list + detail views).
+    """
+    data = db.get_user_appointments_dashboard(
+        user_id=user["id"],
+        page=page,
+        page_size=page_size,
+        from_date=from_date,
+    )
+
+    # Normalize a simple, frontend-friendly shape.
+    out_appts: list[dict] = []
+    for a in data.get("appointments", []) or []:
+        if not isinstance(a, dict):
+            continue
+        out_appts.append(
+            {
+                "id": a.get("id"),
+                "appointment_date": a.get("appointment_date"),
+                "start_time": a.get("start_time"),
+                "end_time": a.get("end_time"),
+                "status": a.get("status"),
+                "title": a.get("title"),
+                "description": a.get("description"),
+                "notes": a.get("notes"),
+                "created_at": a.get("created_at"),
+                # Caller info (what we have in appointments)
+                "caller_name": a.get("attendee_name"),
+                "caller_email": a.get("attendee_email"),
+                "caller_phone": None,
+            }
+        )
+
+    return JSONResponse(
+        content=jsonable_encoder(
+            {
+                "totals": data.get("totals") or {"total": 0, "scheduled": 0, "cancelled": 0, "completed": 0},
+                "page": data.get("page", page),
+                "page_size": data.get("page_size", page_size),
+                "appointments": out_appts,
+            }
+        )
+    )
+
+
 @router.get("/dashboard/calls/{call_id}")
 async def dashboard_call_detail(
     call_id: str,
@@ -560,76 +613,9 @@ async def agent_check_availability(request: Request):
             logging.error("check-availability: missing date/time. keys=%s", list(data.keys()))
             return JSONResponse(status_code=200, content={"available": True, "message": "Missing date or time.", "warning": "missing_fields"})
 
-        logging.info("check-availability: resolved user_id=%s", uid)
-        # Validate env user exists (single-tenant)
-        try:
-            if not db.get_user_by_id(uid):
-                logging.error("check-availability: env user not found user_id=%s", uid)
-                return JSONResponse(status_code=500, content={"available": True, "message": "Server misconfigured: env user not found.", "warning": "env_user_not_found"})
-        except Exception as e:
-            logging.error("check-availability: user lookup failed: %s", e)
-            return JSONResponse(status_code=200, content={"available": True, "message": "Could not verify availability right now.", "warning": "user_lookup_failed"})
-        if not end:
-            try:
-                st_raw = str(start).strip()
-                fmt = "%H:%M:%S" if len(st_raw.split(":")) == 3 else "%H:%M"
-                end = (datetime.strptime(st_raw, fmt) + timedelta(hours=1)).strftime("%H:%M")
-            except ValueError:
-                end = None
-        logging.info("check-availability: query user_id=%s date=%s start=%s end=%s", uid, appt_date, start, end)
-
-        row = None
-        for attempt in range(2):
-            conn = db.get_connection()
-            try:
-                with conn.cursor() as cursor:
-                    cursor.execute(
-                        """
-                        SELECT appointment_date, start_time, end_time, title, attendee_name
-                        FROM appointments
-                        WHERE user_id = %s
-                          AND appointment_date = %s
-                          AND status = 'scheduled'
-                          AND (start_time < %s::time AND end_time > %s::time)
-                        ORDER BY start_time
-                        LIMIT 1
-                        """,
-                        (uid, appt_date, end or start, start),
-                    )
-                    row = cursor.fetchone()
-                break
-            except Exception as e:
-                logging.error("check-availability error: %s", e)
-                try:
-                    conn.rollback()
-                except Exception:
-                    pass
-                if attempt == 0:
-                    continue
-                row = None
-            finally:
-                db.release_connection(conn)
-
-        if row:
-            logging.info("check-availability: conflict found for user_id=%s date=%s", uid, appt_date)
-            conflict_details = {
-                "appointment_date": str(row[0]),
-                "start_time": str(row[1]),
-                "end_time": str(row[2]),
-                "title": row[3],
-                "attendee_name": row[4],
-            }
-            return JSONResponse(
-                {
-                    "available": False,
-                    "message": "That time is already booked. Please pick another slot.",
-                    "conflict_details": conflict_details,
-                }
-            )
-
-        return JSONResponse(
-            {"available": True, "message": "That time is available. You can book it."}
-        )
+        # Per product requirement: allow multiple bookings at the same time.
+        # So this tool never blocks a booking due to conflicts.
+        return JSONResponse({"available": True, "message": "Available."})
     except Exception as e:
         logging.error("check-availability error: %s", e)
         return JSONResponse(
@@ -832,29 +818,6 @@ async def get_user_call_history(
 
         calls = []
         for call in history.get("calls", []):
-            call_data = {**call}
-            
-            # ✅ FIX 1: Ensure timestamps are included and properly formatted
-            # Convert datetime objects to ISO strings if they exist
-            if call.get("created_at"):
-                call_data["created_at"] = call["created_at"].isoformat() if hasattr(call["created_at"], 'isoformat') else str(call["created_at"])
-            
-            if call.get("started_at"):
-                call_data["started_at"] = call["started_at"].isoformat() if hasattr(call["started_at"], 'isoformat') else str(call["started_at"])
-            
-            if call.get("ended_at"):
-                call_data["ended_at"] = call["ended_at"].isoformat() if hasattr(call["ended_at"], 'isoformat') else str(call["ended_at"])
-            
-            # ✅ FIX 2: Calculate display duration if not available
-            if not call_data.get("duration") and call.get("started_at") and call.get("ended_at"):
-                try:
-                    from datetime import datetime
-                    start = call["started_at"] if isinstance(call["started_at"], datetime) else datetime.fromisoformat(str(call["started_at"]))
-                    end = call["ended_at"] if isinstance(call["ended_at"], datetime) else datetime.fromisoformat(str(call["ended_at"]))
-                    call_data["duration"] = round((end - start).total_seconds(), 1)
-                except:
-                    call_data["duration"] = 0
-            
             # Proper transcript text (Retell + legacy formats)
             transcript_text = None
             if call.get("transcript"):
@@ -868,34 +831,21 @@ async def get_user_call_history(
                     transcript_text = _transcript_to_text(tr)
                 except Exception as e:
                     logging.warning(f"Transcript parse error for {call.get('id')}: {e}")
-            call_data["transcript_text"] = transcript_text
-            
-            # ✅ FIX 3: Add recording availability flag
-            call_data["has_recording"] = bool(call.get("recording_url") or call.get("recording_blob_data"))
 
-            # ---- Reference-style fields (additive; keeps existing keys intact) ----
-            call_data["call_status"] = call_data.get("status")
-            call_data["caller_phone"] = call_data.get("from_number")
-            call_data["agent_phone"] = call_data.get("to_number")
-            call_data["direction"] = "inbound"  # current system is inbound-first
-            call_data["call_summary"] = call_data.get("summary")
-            if call_data.get("duration") is not None:
-                try:
-                    call_data["duration_ms"] = int(float(call_data["duration"]) * 1000)
-                except Exception:
-                    call_data["duration_ms"] = None
-            else:
-                call_data["duration_ms"] = None
-            try:
-                sa = call.get("started_at")
-                ea = call.get("ended_at")
-                call_data["start_timestamp"] = int(sa.timestamp() * 1000) if sa else None
-                call_data["end_timestamp"] = int(ea.timestamp() * 1000) if ea else None
-            except Exception:
-                call_data["start_timestamp"] = None
-                call_data["end_timestamp"] = None
-            
-            calls.append(call_data)
+            calls.append(
+                {
+                    "call_id": call.get("call_id"),
+                    "status": call.get("status"),
+                    "caller_phone": call.get("from_number"),
+                    "agent_phone": call.get("to_number"),
+                    "started_at": call.get("started_at"),
+                    "ended_at": call.get("ended_at"),
+                    "duration": call.get("duration"),
+                    "recording_url": call.get("recording_url"),
+                    "summary": call.get("summary"),
+                    "transcript_text": transcript_text,
+                }
+            )
 
         # Build pagination block safely
         pagination = history.get("pagination") or {

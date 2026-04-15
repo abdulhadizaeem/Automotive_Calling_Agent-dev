@@ -1734,6 +1734,93 @@ Tone: Professional and friendly"""
         finally:
             self.release_connection(conn)
 
+    def get_user_appointments_dashboard(
+        self,
+        user_id: int,
+        page: int = 1,
+        page_size: int = 50,
+        from_date: str | None = None,
+    ) -> dict:
+        """
+        Dashboard appointments API helper.
+
+        Returns:
+        {
+          "totals": {"total": int, "scheduled": int, "cancelled": int, "completed": int},
+          "page": int,
+          "page_size": int,
+          "appointments": [ ... ]
+        }
+        """
+        if page < 1:
+            page = 1
+        if page_size < 1:
+            page_size = 50
+        if page_size > 200:
+            page_size = 200
+        if not from_date:
+            from_date = datetime.now(timezone.utc).date().isoformat()
+        offset = (page - 1) * page_size
+
+        conn = self.get_connection()
+        try:
+            with conn.cursor(cursor_factory=RealDictCursor) as cursor:
+                cursor.execute(
+                    """
+                    SELECT
+                      COUNT(*)::int AS total,
+                      COUNT(*) FILTER (WHERE status = 'scheduled')::int AS scheduled,
+                      COUNT(*) FILTER (WHERE status = 'cancelled')::int AS cancelled,
+                      COUNT(*) FILTER (WHERE status = 'completed')::int AS completed
+                    FROM appointments
+                    WHERE user_id = %s
+                      AND appointment_date >= %s
+                    """,
+                    (user_id, from_date),
+                )
+                totals = cursor.fetchone() or {}
+
+                cursor.execute(
+                    """
+                    SELECT
+                        id,
+                        appointment_date,
+                        start_time,
+                        end_time,
+                        attendee_name,
+                        attendee_email,
+                        title,
+                        description,
+                        notes,
+                        status,
+                        created_at
+                    FROM appointments
+                    WHERE user_id = %s
+                      AND appointment_date >= %s
+                    ORDER BY appointment_date, start_time
+                    OFFSET %s
+                    LIMIT %s
+                    """,
+                    (user_id, from_date, offset, page_size),
+                )
+                appts = cursor.fetchall() or []
+                return {
+                    "totals": {
+                        "total": int(totals.get("total") or 0),
+                        "scheduled": int(totals.get("scheduled") or 0),
+                        "cancelled": int(totals.get("cancelled") or 0),
+                        "completed": int(totals.get("completed") or 0),
+                    },
+                    "page": page,
+                    "page_size": page_size,
+                    "appointments": appts,
+                }
+        except Exception as e:
+            logging.error(f"Error getting dashboard appointments for user_id={user_id}: {e}")
+            raise
+        finally:
+            self.release_connection(conn)
+
 
 # import os
 # from datetime import datetime
