@@ -360,17 +360,16 @@ async def dashboard_quick_stats(user=Depends(get_current_user)):
 @router.get("/dashboard/calls/{call_id}")
 async def dashboard_call_detail(
     call_id: str,
-    include_raw_transcript: bool = False,
-    include_word_timestamps: bool = False,
-    include_event_payloads: bool = True,
     user=Depends(get_current_user),
 ):
     """
-    Call row plus Retell webhook trail (events_log, agent_events).
+    Dashboard call detail (compact).
 
-    Defaults are optimized for dashboards:
-    - transcript returned as plain text (not word-level objects)
-    - word-level timestamps are excluded unless requested
+    Intentionally returns ONLY the fields needed by the UI:
+    - call number(s), times, duration
+    - recording_url
+    - transcript (clean text)
+    - summary, sentiment, booking_done
     """
     row = db.get_call_dashboard_detail(call_id, user["id"])
     if not row:
@@ -413,40 +412,76 @@ async def dashboard_call_detail(
         return None
 
     transcript_obj = row.get("transcript")
-    row["transcript_text"] = _transcript_to_text(transcript_obj)
+    transcript_text = _transcript_to_text(transcript_obj)
 
-    # Caller/agent phone numbers (Retell from_number/to_number)
-    row["caller_phone"] = row.get("from_number")
-    row["agent_phone"] = row.get("to_number")
+    # ---- Extract a couple fields from the stored summary (Retell call_analyzed) ----
+    # summary format is free-form text (often includes "Sentiment: X" and "Custom analysis: {...json...}")
+    def _extract_sentiment_and_booking(summary: Any) -> tuple[Optional[str], Optional[bool]]:
+        if not isinstance(summary, str) or not summary.strip():
+            return None, None
+        s = summary
+        sentiment: Optional[str] = None
+        booking_done: Optional[bool] = None
+        try:
+            for line in s.splitlines():
+                if line.lower().startswith("sentiment:"):
+                    sentiment = line.split(":", 1)[1].strip() or None
+                    break
+        except Exception:
+            sentiment = None
+        try:
+            # Look for "Custom analysis: { ... }" JSON blob
+            marker = "Custom analysis:"
+            idx = s.find(marker)
+            if idx != -1:
+                blob = s[idx + len(marker) :].strip()
+                # The JSON is usually the last part; parse best-effort.
+                try:
+                    custom = json.loads(blob)
+                except Exception:
+                    # Sometimes there is trailing text; try to trim to last closing brace.
+                    end = blob.rfind("}")
+                    if end != -1:
+                        custom = json.loads(blob[: end + 1])
+                    else:
+                        custom = None
+                if isinstance(custom, dict) and "appointment_booked" in custom:
+                    booking_done = bool(custom.get("appointment_booked"))
+        except Exception:
+            booking_done = None
+        return sentiment, booking_done
 
-    if not include_raw_transcript:
-        # Remove heavy transcript object from response
-        row["transcript"] = None
-    elif include_raw_transcript and not include_word_timestamps and isinstance(transcript_obj, dict):
-        # Keep structure but drop word-level timestamps to reduce payload size
-        tw = transcript_obj.get("transcript_with_tool_calls")
-        if isinstance(tw, list):
-            compact = []
-            for item in tw:
-                if not isinstance(item, dict):
-                    continue
-                compact.append(
-                    {
-                        "role": item.get("role"),
-                        "content": item.get("content"),
-                        "name": item.get("name"),
-                        "type": item.get("type"),
-                        "time_sec": item.get("time_sec"),
-                        "tool_call_id": item.get("tool_call_id"),
-                        "successful": item.get("successful"),
-                    }
-                )
-            row["transcript"] = {"source": transcript_obj.get("source"), "transcript_with_tool_calls": compact}
+    sentiment, booking_done = _extract_sentiment_and_booking(row.get("summary"))
 
-    if not include_event_payloads:
-        row["events_log"] = []
-        row["agent_events"] = []
+    compact: dict[str, Any] = {
+        "call_id": row.get("call_id") or call_id,
+        "status": row.get("status"),
+        "caller_phone": row.get("from_number"),
+        "agent_phone": row.get("to_number"),
+        "started_at": row.get("started_at"),
+        "ended_at": row.get("ended_at"),
+        "duration": row.get("duration"),
+        "recording_url": row.get("recording_url"),
+        "transcript": transcript_text,
+        "summary": row.get("summary"),
+        "sentiment": sentiment,
+        "booking_done": booking_done,
+    }
+    return JSONResponse(content=jsonable_encoder(compact))
 
+
+@router.get("/dashboard/calls/{call_id}/debug")
+async def dashboard_call_detail_debug(
+    call_id: str,
+    user=Depends(get_current_user),
+):
+    """
+    Debug endpoint: returns the full stored call row including webhook trails.
+    Use this only when troubleshooting Retell payloads.
+    """
+    row = db.get_call_dashboard_detail(call_id, user["id"])
+    if not row:
+        raise HTTPException(status_code=404, detail="Call not found")
     return JSONResponse(content=jsonable_encoder(row))
 
 
