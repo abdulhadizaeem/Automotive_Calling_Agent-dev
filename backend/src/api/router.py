@@ -358,11 +358,95 @@ async def dashboard_quick_stats(user=Depends(get_current_user)):
 
 
 @router.get("/dashboard/calls/{call_id}")
-async def dashboard_call_detail(call_id: str, user=Depends(get_current_user)):
-    """Call row plus Retell webhook trail (events_log, agent_events)."""
+async def dashboard_call_detail(
+    call_id: str,
+    include_raw_transcript: bool = False,
+    include_word_timestamps: bool = False,
+    include_event_payloads: bool = True,
+    user=Depends(get_current_user),
+):
+    """
+    Call row plus Retell webhook trail (events_log, agent_events).
+
+    Defaults are optimized for dashboards:
+    - transcript returned as plain text (not word-level objects)
+    - word-level timestamps are excluded unless requested
+    """
     row = db.get_call_dashboard_detail(call_id, user["id"])
     if not row:
         raise HTTPException(status_code=404, detail="Call not found")
+
+    def _transcript_to_text(t) -> str | None:
+        if not t:
+            return None
+        # Already plain text
+        if isinstance(t, str):
+            return t.strip() or None
+        if isinstance(t, dict):
+            # our wrapper formats
+            if isinstance(t.get("transcript_text"), str):
+                return t["transcript_text"].strip() or None
+            tw = t.get("transcript_with_tool_calls")
+            if isinstance(tw, list):
+                parts: list[str] = []
+                for item in tw:
+                    if not isinstance(item, dict):
+                        continue
+                    role = item.get("role")
+                    content = item.get("content")
+                    if isinstance(content, str) and content.strip():
+                        prefix = "Agent" if role == "agent" else ("Caller" if role == "user" else None)
+                        parts.append(f"{prefix + ': ' if prefix else ''}{content.strip()}")
+                return "\n".join(parts).strip() or None
+            tobj = t.get("transcript_object")
+            if isinstance(tobj, list):
+                parts: list[str] = []
+                for item in tobj:
+                    if not isinstance(item, dict):
+                        continue
+                    role = item.get("role")
+                    content = item.get("content")
+                    if isinstance(content, str) and content.strip():
+                        prefix = "Agent" if role == "agent" else ("Caller" if role == "user" else None)
+                        parts.append(f"{prefix + ': ' if prefix else ''}{content.strip()}")
+                return "\n".join(parts).strip() or None
+        return None
+
+    transcript_obj = row.get("transcript")
+    row["transcript_text"] = _transcript_to_text(transcript_obj)
+
+    # Caller/agent phone numbers (Retell from_number/to_number)
+    row["caller_phone"] = row.get("from_number")
+    row["agent_phone"] = row.get("to_number")
+
+    if not include_raw_transcript:
+        # Remove heavy transcript object from response
+        row["transcript"] = None
+    elif include_raw_transcript and not include_word_timestamps and isinstance(transcript_obj, dict):
+        # Keep structure but drop word-level timestamps to reduce payload size
+        tw = transcript_obj.get("transcript_with_tool_calls")
+        if isinstance(tw, list):
+            compact = []
+            for item in tw:
+                if not isinstance(item, dict):
+                    continue
+                compact.append(
+                    {
+                        "role": item.get("role"),
+                        "content": item.get("content"),
+                        "name": item.get("name"),
+                        "type": item.get("type"),
+                        "time_sec": item.get("time_sec"),
+                        "tool_call_id": item.get("tool_call_id"),
+                        "successful": item.get("successful"),
+                    }
+                )
+            row["transcript"] = {"source": transcript_obj.get("source"), "transcript_with_tool_calls": compact}
+
+    if not include_event_payloads:
+        row["events_log"] = []
+        row["agent_events"] = []
+
     return JSONResponse(content=jsonable_encoder(row))
 
 
@@ -571,24 +655,9 @@ async def agent_send_confirmation(body: SendConfirmationRequest):
         )
 
 
-@router.post("/livekit-webhook")
-async def livekit_webhook(request: Request):
-    raise HTTPException(
-        status_code=410,
-        detail="LiveKit webhooks removed (Retell is now the calling provider). Use /api/retell-webhook.",
-    )
-
-
-
-    
-
-
-@router.post("/livekit-egress-webhook")
-async def livekit_egress_webhook(request: Request):
-    raise HTTPException(
-        status_code=410,
-        detail="LiveKit egress webhooks removed (Retell is now the calling provider).",
-    )
+#
+# LiveKit endpoints removed (Retell is the calling provider).
+#
 
 
 # @router.get("/call-history")
@@ -665,78 +734,9 @@ async def livekit_egress_webhook(request: Request):
 # In routes.py - Update get_call_status endpoint
 
 
-@router.get("/call-status/{call_id}")
-async def get_call_status(call_id: str):
-    """Optimized status check with proper connection handling"""
-    try:
-        conn = db.get_connection()
-        try:
-            with conn.cursor() as cursor:
-                cursor.execute("""
-                    SELECT status, created_at, ended_at, duration, started_at
-                    FROM call_history 
-                    WHERE call_id = %s
-                """, (call_id,))
-                row = cursor.fetchone()
-        finally:
-            db.release_connection(conn)  # ✅ FIXED: Was conn.close()
-        
-        if not row:
-            return JSONResponse(
-                status_code=404,
-                content={"status": "not_found", "is_final": True}
-            )
-        
-        current_status, created_at, ended_at, duration, started_at = row
-        
-        # ✅ Normalize status
-        if current_status not in {"initialized", "dialing", "connected", "completed", "unanswered"}:
-            STATUS_MAP = {
-                "initiated": "initialized",
-                "in_progress": "connected",
-                "failed": "unanswered",
-                "not_attended": "unanswered"
-            }
-            current_status = STATUS_MAP.get(current_status, "initialized")
-        
-        # Calculate elapsed time
-        time_elapsed = 0
-        if created_at:
-            if created_at.tzinfo is None:
-                created_at = created_at.replace(tzinfo=timezone.utc)
-            time_elapsed = (datetime.now(timezone.utc) - created_at).total_seconds()
-        
-        is_final = current_status in {"completed", "unanswered"}
-        
-        response = {
-            "status": current_status,
-            "message": {
-                "initialized": "Initializing...",
-                "dialing": "Dialing...",
-                "connected": "Call in progress",
-                "completed": "Call completed",
-                "unanswered": "Call not answered"
-            }.get(current_status, current_status),
-            "time_elapsed": round(time_elapsed, 1),
-            "is_final": is_final
-        }
-        
-        if is_final and duration:
-            response["duration"] = round(duration, 1)
-        
-        if started_at:
-            response["started_at"] = started_at.isoformat()
-        if ended_at:
-            response["ended_at"] = ended_at.isoformat()
-        
-        return JSONResponse(response)
-        
-    except Exception as e:
-        logging.error(f"get_call_status error: {e}")
-        return JSONResponse(
-            {"status": "error", "message": str(e), "is_final": True},
-            status_code=500
-        )
+#
+# /call-status/{call_id} removed. Use /dashboard/calls/{call_id}.
+#
                             
 
 @router.get("/call-history")
@@ -746,6 +746,53 @@ async def get_user_call_history(
     user=Depends(get_current_user)
 ):
     try:
+        def _transcript_to_text(t) -> str | None:
+            if not t:
+                return None
+            if isinstance(t, str):
+                return t.strip() or None
+            if isinstance(t, dict):
+                if isinstance(t.get("transcript_text"), str):
+                    return t["transcript_text"].strip() or None
+                tw = t.get("transcript_with_tool_calls")
+                if isinstance(tw, list):
+                    parts: list[str] = []
+                    for item in tw:
+                        if not isinstance(item, dict):
+                            continue
+                        role = item.get("role")
+                        content = item.get("content")
+                        if isinstance(content, str) and content.strip():
+                            prefix = "Agent" if role == "agent" else ("Caller" if role == "user" else None)
+                            parts.append(f"{prefix + ': ' if prefix else ''}{content.strip()}")
+                    return "\n".join(parts).strip() or None
+                tobj = t.get("transcript_object")
+                if isinstance(tobj, list):
+                    parts: list[str] = []
+                    for item in tobj:
+                        if not isinstance(item, dict):
+                            continue
+                        role = item.get("role")
+                        content = item.get("content")
+                        if isinstance(content, str) and content.strip():
+                            prefix = "Agent" if role == "agent" else ("Caller" if role == "user" else None)
+                            parts.append(f"{prefix + ': ' if prefix else ''}{content.strip()}")
+                    return "\n".join(parts).strip() or None
+            if isinstance(t, list):
+                # legacy list format (LiveKit-style)
+                lines: list[str] = []
+                for msg in t:
+                    if not isinstance(msg, dict):
+                        continue
+                    if msg.get("type") == "message":
+                        speaker = "Assistant" if msg.get("role") == "assistant" else "User"
+                        content = msg.get("content")
+                        text = " ".join(content) if isinstance(content, list) else (str(content) if content is not None else "")
+                        if text.strip():
+                            lines.append(f"{speaker}: {text.strip()}")
+                return "\n".join(lines).strip() or None
+            return None
+
         history = db.get_call_history_by_user_id(user["id"], page, page_size)
 
         calls = []
@@ -773,24 +820,19 @@ async def get_user_call_history(
                 except:
                     call_data["duration"] = 0
             
-            # Parse transcript text
+            # Proper transcript text (Retell + legacy formats)
             transcript_text = None
             if call.get("transcript"):
                 try:
                     tr = call["transcript"]
                     if isinstance(tr, str):
-                        tr = json.loads(tr)
-                    if isinstance(tr, list):
-                        lines = []
-                        for msg in tr:
-                            if msg.get("type") == "message":
-                                speaker = "Assistant" if msg.get("role") == "assistant" else "User"
-                                text = " ".join(msg.get("content", [])) if isinstance(msg.get("content"), list) else str(msg.get("content"))
-                                lines.append(f"{speaker}: {text}")
-                        transcript_text = "\n".join(lines)
+                        try:
+                            tr = json.loads(tr)
+                        except Exception:
+                            pass
+                    transcript_text = _transcript_to_text(tr)
                 except Exception as e:
                     logging.warning(f"Transcript parse error for {call.get('id')}: {e}")
-            
             call_data["transcript_text"] = transcript_text
             
             # ✅ FIX 3: Add recording availability flag
@@ -843,61 +885,9 @@ async def get_user_call_history(
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@router.get("/call-history/{call_id}")
-async def get_call_history_item(call_id: str, user=Depends(get_current_user)):
-    """
-    History detail (per call id). Includes Retell webhook trail (events_log / agent_events).
-    Shape is additive and compatible with reference-style fields.
-    """
-    row = db.get_call_dashboard_detail(call_id, user["id"])
-    if not row:
-        raise HTTPException(status_code=404, detail="Call not found")
-
-    # Reference-style aliases
-    row["call_status"] = row.get("status")
-    row["caller_phone"] = row.get("from_number")
-    row["agent_phone"] = row.get("to_number")
-    row["direction"] = "inbound"
-    row["call_summary"] = row.get("summary")
-    if row.get("duration") is not None:
-        try:
-            row["duration_ms"] = int(float(row["duration"]) * 1000)
-        except Exception:
-            row["duration_ms"] = None
-    else:
-        row["duration_ms"] = None
-    try:
-        sa = row.get("started_at")
-        ea = row.get("ended_at")
-        row["start_timestamp"] = int(sa.timestamp() * 1000) if sa else None
-        row["end_timestamp"] = int(ea.timestamp() * 1000) if ea else None
-    except Exception:
-        row["start_timestamp"] = None
-        row["end_timestamp"] = None
-
-    # Human-friendly transcript text
-    transcript_text = None
-    tr = row.get("transcript")
-    try:
-        if isinstance(tr, str):
-            tr = json.loads(tr)
-        if isinstance(tr, list):
-            lines = []
-            for msg in tr:
-                if isinstance(msg, dict) and msg.get("type") == "message":
-                    speaker = "Assistant" if msg.get("role") == "assistant" else "User"
-                    text = " ".join(msg.get("content", [])) if isinstance(msg.get("content"), list) else str(msg.get("content"))
-                    lines.append(f"{speaker}: {text}")
-            transcript_text = "\n".join(lines)
-        elif isinstance(tr, dict):
-            # retell transcript payload wrapper (we keep raw; text extraction best-effort)
-            transcript_text = None
-    except Exception:
-        transcript_text = None
-    row["transcript_text"] = transcript_text
-    row["has_recording"] = bool(row.get("recording_url") or row.get("recording_blob_data"))
-
-    return JSONResponse(content=jsonable_encoder(row))
+#
+# /call-history/{call_id} removed. Use /dashboard/calls/{call_id}.
+#
 
 
 @router.get("/agent/get-appointments/{user_id}")
@@ -1104,75 +1094,9 @@ async def book_appointment(request: Request):
 
 
 
-@router.post("/agent/save-call-data")
-async def save_call_data(request: Request):
-    raise HTTPException(
-        status_code=410,
-        detail="save-call-data removed (Retell webhooks persist transcript/recording_url).",
-    )
-    
-
-
-
-@router.post("/agent/report-event")
-async def receive_agent_event(request: Request):
-    try:
-        data = await request.json()
-        
-        call_id = data.get("call_id")
-        status = data.get("status")
-        timestamp = data.get("timestamp")
-        
-        if not call_id or not status:
-            return JSONResponse({"error": "Missing data"}, status_code=400)
-        
-        # Retell flow may report end outcomes; keep backward compatibility with LiveKit statuses.
-        allowed = {
-            "initialized",
-            "dialing",
-            "connected",
-            "unanswered",
-            "completed",
-            "failed",
-            "no_availability",
-            "callback_requested",
-        }
-        if status not in allowed:
-            return JSONResponse({"error": "Invalid status"}, status_code=400)
-        
-        # ✅ Build updates
-        updates = {"status": status}
-        now = datetime.now(timezone.utc)
-        
-        # ✅ Set started_at on dialing/connected
-        if status in {"dialing", "connected"}:
-            conn = db.get_connection()
-            try:
-                with conn.cursor() as cursor:
-                    cursor.execute(
-                        "SELECT started_at FROM call_history WHERE call_id = %s",
-                        (call_id,)
-                    )
-                    row = cursor.fetchone()
-                    if row and not row[0]:
-                        updates["started_at"] = now
-            finally:
-                db.release_connection(conn)
-        
-        # ✅ Handle terminal states
-        if status in {"unanswered", "completed", "failed", "no_availability", "callback_requested"}:
-            updates["ended_at"] = now
-            if status in {"unanswered", "failed"}:
-                updates["duration"] = 0
-        
-        db.update_call_history(call_id, updates)
-        
-        # Retell tool expects acknowledged=true (see agent.json response_variables)
-        return JSONResponse({"success": True, "acknowledged": True})
-        
-    except Exception as e:
-        logging.error(f"report-event error: {e}")
-        return JSONResponse({"error": str(e)}, status_code=500)
+#
+# /agent/save-call-data and /agent/report-event removed. Retell webhooks persist call state.
+#
     
 
 
@@ -1273,48 +1197,7 @@ async def reset_prompt_customization(user=Depends(get_current_user)):
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))
 
-@router.options("/calls/{call_id}/recording/stream")
-async def stream_call_recording_options(call_id: str):
-    raise HTTPException(
-        status_code=410,
-        detail="Recording streaming removed. Use call_history.recording_url from /api/call-history.",
-    )
-
-@router.get("/calls/{call_id}/recording/stream")
-async def stream_call_recording(
-    call_id: str, 
-    user=Depends(get_current_user),
-    request: Request = None
-):
-    raise HTTPException(
-        status_code=410,
-        detail="Recording streaming removed. Use call_history.recording_url from /api/call-history.",
-    )
-    
-
-@router.get("/calls/{call_id}/transcript")
-async def get_call_transcript(call_id: str, user=Depends(get_current_user)):
-    """Get transcript for a specific call"""
-    try:
-        conn = db.get_connection()
-        try:
-            with conn.cursor() as cursor:
-                cursor.execute("""
-                    SELECT transcript
-                    FROM call_history
-                    WHERE call_id = %s AND user_id = %s
-                """, (call_id, user["id"]))
-                row = cursor.fetchone()
-        finally:
-            db.release_connection(conn)
-        
-        if not row or not row[0]:
-            raise HTTPException(status_code=404, detail="Transcript not found")
-        
-        return JSONResponse({"transcript": row[0]})
-        
-    except HTTPException:
-        raise
-    except Exception as e:
-        logging.error(f"Error fetching transcript: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+#
+# /calls/{call_id}/recording/stream and /calls/{call_id}/transcript removed.
+# Use /dashboard/calls/{call_id} for transcript_text and recording_url.
+#
