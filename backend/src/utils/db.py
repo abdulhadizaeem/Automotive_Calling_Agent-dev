@@ -1,4 +1,5 @@
 import os
+import uuid
 from datetime import datetime, timezone
 import bcrypt
 import urllib.parse
@@ -43,6 +44,7 @@ class PGDB:
         self.create_user_prompts_table()
         self.create_retell_webhook_dedupe_table()
         self.create_inbound_call_settings_table()
+        self.create_prompts_table()
         self.ensure_call_history_schema()
         self.ensure_users_schema()
         self.ensure_appointments_schema()
@@ -198,7 +200,9 @@ class PGDB:
                         description TEXT,
                         notes TEXT,
                         status VARCHAR(50) DEFAULT 'scheduled',
-                        created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
+                        created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
+                        caller_phone TEXT,
+                        call_id TEXT
                     );
                 """)
             conn.commit()
@@ -230,6 +234,38 @@ class PGDB:
             logging.info("✅ user_prompts table created")
         except Exception as e:
             logging.error(f"Error creating user_prompts table: {e}")
+            conn.rollback()
+        finally:
+            self.release_connection(conn)
+
+    def create_prompts_table(self):
+        """
+        Versioned named prompts per user (REST: GET/POST /api/prompts).
+        Distinct from user_prompts (single active system prompt string).
+        """
+        conn = self.get_connection()
+        try:
+            with conn.cursor() as cursor:
+                cursor.execute("""
+                    CREATE TABLE IF NOT EXISTS prompts (
+                        id UUID PRIMARY KEY,
+                        user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                        name VARCHAR(255) NOT NULL,
+                        version INTEGER NOT NULL,
+                        description TEXT,
+                        text TEXT NOT NULL,
+                        is_active BOOLEAN NOT NULL DEFAULT TRUE,
+                        created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                        UNIQUE (user_id, name, version)
+                    );
+                """)
+                cursor.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_prompts_user_name ON prompts (user_id, name);"
+                )
+            conn.commit()
+            logging.info("prompts table ready")
+        except Exception as e:
+            logging.error(f"Error creating prompts table: {e}")
             conn.rollback()
         finally:
             self.release_connection(conn)
@@ -405,6 +441,8 @@ class PGDB:
                         "ALTER TABLE appointments ADD COLUMN IF NOT EXISTS created_at "
                         "TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP;"
                     ),
+                    "ALTER TABLE appointments ADD COLUMN IF NOT EXISTS caller_phone TEXT;",
+                    "ALTER TABLE appointments ADD COLUMN IF NOT EXISTS call_id TEXT;",
                 ):
                     cursor.execute(stmt)
             conn.commit()
@@ -434,6 +472,74 @@ class PGDB:
             conn.rollback()
             logging.error(f"Error migrating user_prompts schema: {e}")
             traceback.print_exc()
+        finally:
+            self.release_connection(conn)
+
+    # ==================== NAMED PROMPTS (LIBRARY) ====================
+
+    def list_prompts_for_user(self, user_id: int) -> list[dict]:
+        """All versioned prompts for a user, ordered by name then version descending."""
+        conn = self.get_connection()
+        try:
+            with conn.cursor(cursor_factory=RealDictCursor) as cursor:
+                cursor.execute(
+                    """
+                    SELECT id, name, version, description, text, is_active, created_at
+                    FROM prompts
+                    WHERE user_id = %s
+                    ORDER BY name ASC, version DESC
+                    """,
+                    (user_id,),
+                )
+                rows = cursor.fetchall() or []
+                return [dict(r) for r in rows]
+        except Exception as e:
+            logging.error(f"Error listing prompts for user_id={user_id}: {e}")
+            raise
+        finally:
+            self.release_connection(conn)
+
+    def create_prompt_version(
+        self,
+        user_id: int,
+        name: str,
+        description: str | None,
+        text: str,
+    ) -> dict:
+        """Insert the next version for (user_id, name); returns the new row."""
+        pid = str(uuid.uuid4())
+        conn = self.get_connection()
+        try:
+            with conn.cursor(cursor_factory=RealDictCursor) as cursor:
+                cursor.execute(
+                    """
+                    INSERT INTO prompts (
+                        id, user_id, name, version, description, text, is_active, created_at
+                    )
+                    VALUES (
+                        %s::uuid,
+                        %s,
+                        %s,
+                        (SELECT COALESCE(MAX(version), 0) + 1 FROM prompts p2
+                         WHERE p2.user_id = %s AND p2.name = %s),
+                        %s,
+                        %s,
+                        TRUE,
+                        CURRENT_TIMESTAMP
+                    )
+                    RETURNING id, name, version, description, text, is_active, created_at
+                    """,
+                    (pid, user_id, name, user_id, name, description, text),
+                )
+                row = cursor.fetchone()
+                conn.commit()
+                if not row:
+                    raise RuntimeError("create_prompt_version: no row returned")
+                return dict(row)
+        except Exception as e:
+            conn.rollback()
+            logging.error(f"Error creating prompt version for user_id={user_id}: {e}")
+            raise
         finally:
             self.release_connection(conn)
 
@@ -1638,7 +1744,9 @@ Tone: Professional and friendly"""
         attendee_name: str,
         attendee_email: str,
         title: str,
-        description: str
+        description: str,
+        caller_phone: str | None = None,
+        call_id: str | None = None,
     ) -> int:
         """
         Create a new appointment in the database
@@ -1653,14 +1761,16 @@ Tone: Professional and friendly"""
                         INSERT INTO appointments (
                             user_id, appointment_date, start_time, end_time,
                             attendee_name, attendee_email, title, description,
-                            status, created_at
+                            status, created_at, caller_phone, call_id
                         )
-                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, NOW())
+                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, NOW(), %s, %s)
                         RETURNING id
                     """, (
                         user_id, appointment_date, start_time, end_time,
                         attendee_name, attendee_email, title, description,
-                        'scheduled'
+                        'scheduled',
+                        caller_phone,
+                        call_id,
                     ))
 
                     appointment_id = cursor.fetchone()[0]
@@ -1719,7 +1829,9 @@ Tone: Professional and friendly"""
                         description,
                         notes,
                         status,
-                        created_at
+                        created_at,
+                        caller_phone,
+                        call_id
                     FROM appointments
                     WHERE user_id = %s
                       AND appointment_date >= %s
@@ -1740,9 +1852,14 @@ Tone: Professional and friendly"""
         page: int = 1,
         page_size: int = 50,
         from_date: str | None = None,
+        all_time: bool = True,
+        max_fetch: int = 5000,
     ) -> dict:
         """
         Dashboard appointments API helper.
+
+        When all_time is True, returns every appointment for the user (up to max_fetch),
+        ordered by date/time descending; from_date and pagination are ignored.
 
         Returns:
         {
@@ -1758,13 +1875,70 @@ Tone: Professional and friendly"""
             page_size = 50
         if page_size > 200:
             page_size = 200
-        if not from_date:
-            from_date = datetime.now(timezone.utc).date().isoformat()
-        offset = (page - 1) * page_size
+        if max_fetch < 1:
+            max_fetch = 5000
+        if max_fetch > 10000:
+            max_fetch = 10000
 
         conn = self.get_connection()
         try:
             with conn.cursor(cursor_factory=RealDictCursor) as cursor:
+                if all_time:
+                    cursor.execute(
+                        """
+                        SELECT
+                          COUNT(*)::int AS total,
+                          COUNT(*) FILTER (WHERE status = 'scheduled')::int AS scheduled,
+                          COUNT(*) FILTER (WHERE status = 'cancelled')::int AS cancelled,
+                          COUNT(*) FILTER (WHERE status = 'completed')::int AS completed
+                        FROM appointments
+                        WHERE user_id = %s
+                        """,
+                        (user_id,),
+                    )
+                    totals = cursor.fetchone() or {}
+
+                    cursor.execute(
+                        """
+                        SELECT
+                            id,
+                            appointment_date,
+                            start_time,
+                            end_time,
+                            attendee_name,
+                            attendee_email,
+                            title,
+                            description,
+                            notes,
+                            status,
+                            created_at,
+                            caller_phone,
+                            call_id
+                        FROM appointments
+                        WHERE user_id = %s
+                        ORDER BY appointment_date DESC, start_time DESC
+                        LIMIT %s
+                        """,
+                        (user_id, max_fetch),
+                    )
+                    appts = cursor.fetchall() or []
+                    n = len(appts)
+                    return {
+                        "totals": {
+                            "total": int(totals.get("total") or 0),
+                            "scheduled": int(totals.get("scheduled") or 0),
+                            "cancelled": int(totals.get("cancelled") or 0),
+                            "completed": int(totals.get("completed") or 0),
+                        },
+                        "page": 1,
+                        "page_size": n,
+                        "appointments": appts,
+                    }
+
+                if not from_date:
+                    from_date = datetime.now(timezone.utc).date().isoformat()
+                offset = (page - 1) * page_size
+
                 cursor.execute(
                     """
                     SELECT
@@ -1793,7 +1967,9 @@ Tone: Professional and friendly"""
                         description,
                         notes,
                         status,
-                        created_at
+                        created_at,
+                        caller_phone,
+                        call_id
                     FROM appointments
                     WHERE user_id = %s
                       AND appointment_date >= %s

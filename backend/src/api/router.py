@@ -359,23 +359,27 @@ async def dashboard_quick_stats(user=Depends(get_current_user)):
 
 @router.get("/dashboard/appointments")
 async def dashboard_appointments(
+    all_time: bool = Query(
+        True,
+        description="When true (default), return every appointment in one response (newest first, capped at 5000). When false, use from_date + pagination.",
+    ),
     page: int = Query(1, ge=1),
     page_size: int = Query(50, ge=1, le=200),
-    from_date: str | None = Query(None, description="YYYY-MM-DD (defaults to today, UTC)"),
+    from_date: str | None = Query(None, description="YYYY-MM-DD (used only when all_time=false; defaults to today UTC)"),
     user=Depends(get_current_user),
 ):
     """
     Single endpoint for the frontend:
-    returns totals + the list of appointments (each item includes all details needed for list + detail views).
+    totals plus the full appointment list (caller phone and linked call_id when stored).
     """
     data = db.get_user_appointments_dashboard(
         user_id=user["id"],
         page=page,
         page_size=page_size,
         from_date=from_date,
+        all_time=all_time,
     )
 
-    # Normalize a simple, frontend-friendly shape.
     out_appts: list[dict] = []
     for a in data.get("appointments", []) or []:
         if not isinstance(a, dict):
@@ -391,23 +395,22 @@ async def dashboard_appointments(
                 "description": a.get("description"),
                 "notes": a.get("notes"),
                 "created_at": a.get("created_at"),
-                # Caller info (what we have in appointments)
                 "caller_name": a.get("attendee_name"),
                 "caller_email": a.get("attendee_email"),
-                "caller_phone": None,
+                "caller_phone": a.get("caller_phone"),
+                "call_id": a.get("call_id"),
             }
         )
 
-    return JSONResponse(
-        content=jsonable_encoder(
-            {
-                "totals": data.get("totals") or {"total": 0, "scheduled": 0, "cancelled": 0, "completed": 0},
-                "page": data.get("page", page),
-                "page_size": data.get("page_size", page_size),
-                "appointments": out_appts,
-            }
-        )
-    )
+    payload: dict = {
+        "totals": data.get("totals") or {"total": 0, "scheduled": 0, "cancelled": 0, "completed": 0},
+        "appointments": out_appts,
+    }
+    if not all_time:
+        payload["page"] = data.get("page", page)
+        payload["page_size"] = data.get("page_size", page_size)
+
+    return JSONResponse(content=jsonable_encoder(payload))
 
 
 @router.get("/dashboard/calls/{call_id}")
@@ -894,7 +897,9 @@ async def get_appointments(user_id: int, from_date: str = None):
                     "attendee_name": apt["attendee_name"],
                     "title": apt["title"],
                     "description": apt["description"],
-                    "status": apt["status"]
+                    "status": apt["status"],
+                    "caller_phone": apt.get("caller_phone"),
+                    "call_id": apt.get("call_id"),
                 }
                 for apt in appointments
             ]
@@ -1036,7 +1041,17 @@ async def book_appointment(request: Request):
         
         # ✅ REMOVED: Conflict checking
         # Just book directly
-        
+
+        raw_phone = (
+            data.get("caller_phone")
+            or data.get("from_number")
+            or data.get("customer_phone")
+            or data.get("phone")
+        )
+        caller_phone = (str(raw_phone).strip() if raw_phone is not None else "") or None
+        raw_cid = data.get("call_id") or data.get("retell_call_id")
+        linked_call_id = (str(raw_cid).strip() if raw_cid is not None else "") or None
+
         appointment_id = db.create_appointment(
             user_id=user_id,
             appointment_date=appointment_date,
@@ -1045,7 +1060,9 @@ async def book_appointment(request: Request):
             attendee_name=attendee_name,
             attendee_email=attendee_email,
             title=title,
-            description=description
+            description=description,
+            caller_phone=caller_phone,
+            call_id=linked_call_id,
         )
         
         # Send calendar invite email only if caller email was provided.
@@ -1069,7 +1086,6 @@ async def book_appointment(request: Request):
             "success": True,
             "appointment_id": str(appointment_id),
             "email_sent": email_sent,
-            "message": "Appointment booked successfully" + ("" if organizer_email else " (no email provided)")
         })
         
     except Exception as e:
@@ -1095,6 +1111,47 @@ from pydantic import BaseModel, Field
 
 class PromptCustomizationUpdate(BaseModel):
     system_prompt: str = Field(..., min_length=10, max_length=10000)
+
+
+@router.get("/dashboard/prompt")
+async def dashboard_get_prompt(user=Depends(get_current_user)):
+    """Compact prompt read: system_prompt and updated_at only."""
+    prompt_data = db.get_user_prompt(user["id"])
+    if not prompt_data:
+        return error_response("Prompt not found", status_code=404)
+    return JSONResponse(
+        content=jsonable_encoder(
+            {
+                "system_prompt": prompt_data["system_prompt"],
+                "updated_at": prompt_data["updated_at"],
+            }
+        )
+    )
+
+
+@router.put("/dashboard/prompt")
+async def dashboard_put_prompt(
+    customization: PromptCustomizationUpdate,
+    user=Depends(get_current_user),
+):
+    """Compact prompt update: returns system_prompt and updated_at only."""
+    prompt_text = customization.system_prompt.strip()
+    if not prompt_text:
+        return error_response("System prompt cannot be empty", status_code=400)
+    updated_prompt = db.update_user_system_prompt(
+        user_id=user["id"],
+        system_prompt=prompt_text,
+    )
+    if not updated_prompt:
+        return error_response("Failed to update prompt", status_code=500)
+    return JSONResponse(
+        content=jsonable_encoder(
+            {
+                "system_prompt": updated_prompt["system_prompt"],
+                "updated_at": updated_prompt["updated_at"],
+            }
+        )
+    )
 
 
 @router.get("/prompt-customization")
