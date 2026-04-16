@@ -1,5 +1,4 @@
 from .router import router
-from .prompts_router import router as prompts_router
 from fastapi import HTTPException
 from fastapi.responses import JSONResponse
 from urllib.request import Request
@@ -30,7 +29,6 @@ def create_app():
     )
 
     app.include_router(router, tags=["Auth"], prefix="/api")
-    app.include_router(prompts_router, prefix="/api")
 
     # Route Handlers
     @app.get("/health")

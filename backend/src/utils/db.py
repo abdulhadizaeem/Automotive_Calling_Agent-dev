@@ -1,5 +1,4 @@
 import os
-import uuid
 from datetime import datetime, timezone
 import bcrypt
 import urllib.parse
@@ -16,6 +15,7 @@ load_dotenv()
 class PGDB:
     _instance = None
     _pool = None
+    _initialized = False
     
     def __new__(cls):
         if cls._instance is None:
@@ -23,7 +23,9 @@ class PGDB:
         return cls._instance
     
     def __init__(self):
-        if PGDB._pool is not None:
+        # Important: when pooling is disabled, _pool stays None. Use an explicit
+        # initialized flag so we don't re-run migrations on every import.
+        if PGDB._initialized:
             return  # Already initialized
             
         self.connection_string = os.getenv('DATABASE_URL')
@@ -44,11 +46,12 @@ class PGDB:
         self.create_user_prompts_table()
         self.create_retell_webhook_dedupe_table()
         self.create_inbound_call_settings_table()
-        self.create_prompts_table()
         self.ensure_call_history_schema()
         self.ensure_users_schema()
         self.ensure_appointments_schema()
         self.ensure_user_prompts_schema()
+
+        PGDB._initialized = True
 
     def get_connection(self):
         """
@@ -234,38 +237,6 @@ class PGDB:
             logging.info("✅ user_prompts table created")
         except Exception as e:
             logging.error(f"Error creating user_prompts table: {e}")
-            conn.rollback()
-        finally:
-            self.release_connection(conn)
-
-    def create_prompts_table(self):
-        """
-        Versioned named prompts per user (REST: GET/POST /api/prompts).
-        Distinct from user_prompts (single active system prompt string).
-        """
-        conn = self.get_connection()
-        try:
-            with conn.cursor() as cursor:
-                cursor.execute("""
-                    CREATE TABLE IF NOT EXISTS prompts (
-                        id UUID PRIMARY KEY,
-                        user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-                        name VARCHAR(255) NOT NULL,
-                        version INTEGER NOT NULL,
-                        description TEXT,
-                        text TEXT NOT NULL,
-                        is_active BOOLEAN NOT NULL DEFAULT TRUE,
-                        created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
-                        UNIQUE (user_id, name, version)
-                    );
-                """)
-                cursor.execute(
-                    "CREATE INDEX IF NOT EXISTS idx_prompts_user_name ON prompts (user_id, name);"
-                )
-            conn.commit()
-            logging.info("prompts table ready")
-        except Exception as e:
-            logging.error(f"Error creating prompts table: {e}")
             conn.rollback()
         finally:
             self.release_connection(conn)
@@ -472,74 +443,6 @@ class PGDB:
             conn.rollback()
             logging.error(f"Error migrating user_prompts schema: {e}")
             traceback.print_exc()
-        finally:
-            self.release_connection(conn)
-
-    # ==================== NAMED PROMPTS (LIBRARY) ====================
-
-    def list_prompts_for_user(self, user_id: int) -> list[dict]:
-        """All versioned prompts for a user, ordered by name then version descending."""
-        conn = self.get_connection()
-        try:
-            with conn.cursor(cursor_factory=RealDictCursor) as cursor:
-                cursor.execute(
-                    """
-                    SELECT id, name, version, description, text, is_active, created_at
-                    FROM prompts
-                    WHERE user_id = %s
-                    ORDER BY name ASC, version DESC
-                    """,
-                    (user_id,),
-                )
-                rows = cursor.fetchall() or []
-                return [dict(r) for r in rows]
-        except Exception as e:
-            logging.error(f"Error listing prompts for user_id={user_id}: {e}")
-            raise
-        finally:
-            self.release_connection(conn)
-
-    def create_prompt_version(
-        self,
-        user_id: int,
-        name: str,
-        description: str | None,
-        text: str,
-    ) -> dict:
-        """Insert the next version for (user_id, name); returns the new row."""
-        pid = str(uuid.uuid4())
-        conn = self.get_connection()
-        try:
-            with conn.cursor(cursor_factory=RealDictCursor) as cursor:
-                cursor.execute(
-                    """
-                    INSERT INTO prompts (
-                        id, user_id, name, version, description, text, is_active, created_at
-                    )
-                    VALUES (
-                        %s::uuid,
-                        %s,
-                        %s,
-                        (SELECT COALESCE(MAX(version), 0) + 1 FROM prompts p2
-                         WHERE p2.user_id = %s AND p2.name = %s),
-                        %s,
-                        %s,
-                        TRUE,
-                        CURRENT_TIMESTAMP
-                    )
-                    RETURNING id, name, version, description, text, is_active, created_at
-                    """,
-                    (pid, user_id, name, user_id, name, description, text),
-                )
-                row = cursor.fetchone()
-                conn.commit()
-                if not row:
-                    raise RuntimeError("create_prompt_version: no row returned")
-                return dict(row)
-        except Exception as e:
-            conn.rollback()
-            logging.error(f"Error creating prompt version for user_id={user_id}: {e}")
-            raise
         finally:
             self.release_connection(conn)
 

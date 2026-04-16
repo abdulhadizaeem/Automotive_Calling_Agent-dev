@@ -522,3 +522,147 @@ def retell_get_call(call_id: str) -> dict[str, Any]:
     if not isinstance(data, dict):
         raise RuntimeError("Unexpected Retell get-call response")
     return data
+
+
+def retell_get_agent(agent_id: str, version: int | None = None) -> dict[str, Any]:
+    """Fetch current agent config (includes prompt) from Retell HTTP API."""
+    import requests
+
+    api_key = (os.getenv("RETELL_API_KEY") or "").strip()
+    if not api_key:
+        raise RuntimeError("RETELL_API_KEY is not configured")
+    aid = (agent_id or "").strip()
+    if not aid:
+        raise RuntimeError("agent_id is required")
+    url = f"https://api.retellai.com/get-agent/{aid}"
+    params: dict[str, Any] = {}
+    if version is not None:
+        params["version"] = int(version)
+    r = requests.get(
+        url,
+        headers={"Authorization": f"Bearer {api_key}"},
+        params=params or None,
+        timeout=45,
+    )
+    r.raise_for_status()
+    data = r.json()
+    if not isinstance(data, dict):
+        raise RuntimeError("Unexpected Retell get-agent response")
+    return data
+
+
+def retell_update_agent(agent_id: str, updates: dict[str, Any], version: int | None = None) -> dict[str, Any]:
+    """Patch the latest draft agent config in Retell."""
+    import requests
+
+    api_key = (os.getenv("RETELL_API_KEY") or "").strip()
+    if not api_key:
+        raise RuntimeError("RETELL_API_KEY is not configured")
+    aid = (agent_id or "").strip()
+    if not aid:
+        raise RuntimeError("agent_id is required")
+    if not isinstance(updates, dict) or not updates:
+        raise RuntimeError("updates body must be a non-empty JSON object")
+
+    url = f"https://api.retellai.com/update-agent/{aid}"
+    params: dict[str, Any] = {}
+    if version is not None:
+        params["version"] = int(version)
+    r = requests.patch(
+        url,
+        headers={"Authorization": f"Bearer {api_key}"},
+        params=params or None,
+        json=updates,
+        timeout=45,
+    )
+    r.raise_for_status()
+    data = r.json()
+    if not isinstance(data, dict):
+        raise RuntimeError("Unexpected Retell update-agent response")
+    return data
+
+
+def retell_list_voices() -> list[dict[str, Any]]:
+    """List available voices from Retell (for UI selection)."""
+    import requests
+
+    api_key = (os.getenv("RETELL_API_KEY") or "").strip()
+    if not api_key:
+        raise RuntimeError("RETELL_API_KEY is not configured")
+    url = "https://api.retellai.com/list-voices"
+    r = requests.get(
+        url,
+        headers={"Authorization": f"Bearer {api_key}"},
+        timeout=45,
+    )
+    r.raise_for_status()
+    data = r.json()
+    if not isinstance(data, list):
+        raise RuntimeError("Unexpected Retell list-voices response")
+    out: list[dict[str, Any]] = []
+    for v in data:
+        if isinstance(v, dict):
+            out.append(v)
+    return out
+
+
+def retell_get_conversation_flow(conversation_flow_id: str, version: int | None = None) -> dict[str, Any]:
+    """Fetch conversation flow definition from Retell."""
+    import requests
+
+    api_key = (os.getenv("RETELL_API_KEY") or "").strip()
+    if not api_key:
+        raise RuntimeError("RETELL_API_KEY is not configured")
+    fid = (conversation_flow_id or "").strip()
+    if not fid:
+        raise RuntimeError("conversation_flow_id is required")
+    url = f"https://api.retellai.com/get-conversation-flow/{fid}"
+    params: dict[str, Any] = {}
+    if version is not None:
+        params["version"] = int(version)
+    r = requests.get(
+        url,
+        headers={"Authorization": f"Bearer {api_key}"},
+        params=params or None,
+        timeout=45,
+    )
+    r.raise_for_status()
+    data = r.json()
+    if not isinstance(data, dict):
+        raise RuntimeError("Unexpected Retell get-conversation-flow response")
+    return data
+
+
+def retell_update_conversation_flow(
+    conversation_flow_id: str,
+    updates: dict[str, Any],
+    version: int | None = None,
+) -> dict[str, Any]:
+    """Patch conversation flow definition in Retell."""
+    import requests
+
+    api_key = (os.getenv("RETELL_API_KEY") or "").strip()
+    if not api_key:
+        raise RuntimeError("RETELL_API_KEY is not configured")
+    fid = (conversation_flow_id or "").strip()
+    if not fid:
+        raise RuntimeError("conversation_flow_id is required")
+    if not isinstance(updates, dict) or not updates:
+        raise RuntimeError("updates body must be a non-empty JSON object")
+
+    url = f"https://api.retellai.com/update-conversation-flow/{fid}"
+    params: dict[str, Any] = {}
+    if version is not None:
+        params["version"] = int(version)
+    r = requests.patch(
+        url,
+        headers={"Authorization": f"Bearer {api_key}"},
+        params=params or None,
+        json=updates,
+        timeout=45,
+    )
+    r.raise_for_status()
+    data = r.json()
+    if not isinstance(data, dict):
+        raise RuntimeError("Unexpected Retell update-conversation-flow response")
+    return data

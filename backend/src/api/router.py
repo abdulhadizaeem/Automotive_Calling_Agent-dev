@@ -43,6 +43,11 @@ from src.utils.retell_utils import (
     resolve_agent_tool_user_id,
     resolve_inbound_user_id,
     retell_get_call,
+    retell_get_agent,
+    retell_update_agent,
+    retell_list_voices,
+    retell_get_conversation_flow,
+    retell_update_conversation_flow,
 )
 
 load_dotenv()
@@ -50,7 +55,6 @@ load_dotenv()
 router = APIRouter()
 mail_obj = Send_Mail()
 db = PGDB()
-db.create_retell_webhook_dedupe_table()
 load_dotenv(override=True)
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 GCS_BUCKET_NAME = os.getenv("GOOGLE_BUCKET_NAME")
@@ -555,133 +559,219 @@ async def dashboard_call_live(call_id: str, user=Depends(get_current_user)):
     return JSONResponse(content=payload)
 
 
-@router.get("/agent/get-current-datetime")
-async def agent_get_current_datetime():
+#
+# NOTE: Retell agent prompt endpoints removed (UI only edits flow prompt + voice).
+#
+
+
+@router.get("/retell/voices")
+async def retell_get_voices(user=Depends(get_current_user)):
     """
-    Legacy: prefer inbound webhook dynamic variables (current_date, current_time, …) in the
-    Retell prompt instead of a tool call. Remove the tool from your Conversation Flow when migrated.
+    List voices from Retell + current agent voice_id for UI selection.
+
+    Filters applied (per UI requirement):
+    - provider: ElevenLabs (voice_id prefix '11labs-')
+    - gender: female
+    - age: middle-aged
+    - language: english or spanish (if Retell provides language metadata)
     """
-    now = datetime.now(timezone.utc)
+    agent_id = (os.getenv("RETELL_AGENT_ID") or "").strip()
+    if not agent_id:
+        raise HTTPException(status_code=500, detail="RETELL_AGENT_ID is not configured")
+    try:
+        agent = retell_get_agent(agent_id)
+        voices = retell_list_voices()
+    except Exception as e:
+        logging.error("Retell voices fetch failed: %s", e)
+        raise HTTPException(status_code=502, detail=str(e))
+
+    def _norm(s: object) -> str:
+        return str(s or "").strip().lower()
+
+    def _is_11labs(v: dict) -> bool:
+        vid = _norm(v.get("voice_id"))
+        prov = _norm(v.get("provider"))
+        return vid.startswith("11labs-") or prov in ("11labs", "elevenlabs")
+
+    allowed_lang = {"en", "eng", "english", "es", "spa", "spanish"}
+    filtered: list[dict] = []
+    for v in voices:
+        if not isinstance(v, dict):
+            continue
+        if not _is_11labs(v):
+            continue
+        if _norm(v.get("gender")) != "female":
+            continue
+        # Retell may use "middle_aged" or "middle-aged" or "middle aged"
+        age = _norm(v.get("age")).replace("_", " ").replace("-", " ")
+        if age not in ("middle aged", "middleage", "middle"):
+            # tolerate a few variants
+            if "middle" not in age:
+                continue
+        lang = _norm(v.get("language") or v.get("lang"))
+        # If language isn't provided by Retell, allow it through; otherwise enforce EN/ES
+        if lang and lang not in allowed_lang:
+            continue
+
+        filtered.append(
+            {
+                "voice_id": v.get("voice_id"),
+                "voice_name": v.get("voice_name"),
+                "provider": v.get("provider"),
+                "gender": v.get("gender"),
+                "age": v.get("age"),
+                "accent": v.get("accent"),
+                "language": v.get("language") or v.get("lang"),
+                "preview_audio_url": v.get("preview_audio_url"),
+            }
+        )
+
     return JSONResponse(
-        {
-            "current_date": now.strftime("%Y-%m-%d"),
-            "iso_date": now.date().isoformat(),
-            "current_time": now.strftime("%H:%M"),
-            "day_of_week": now.strftime("%A"),
-            "timezone": "UTC",
-        }
+        content=jsonable_encoder(
+            {
+                "current_voice_id": agent.get("voice_id"),
+                "voices": filtered,
+            }
+        )
     )
 
 
-# Backward-compat: your Retell tool config currently uses POST for get_current_datetime.
-@router.post("/agent/get-current-datetime")
-async def agent_get_current_datetime_post():
-    return await agent_get_current_datetime()
+class RetellAgentVoiceUpdate(BaseModel):
+    voice_id: str
 
 
-@router.post("/agent/check-availability")
-async def agent_check_availability(request: Request):
-    """
-    Checks for conflicts in the appointments table.
-    Returns {available: bool, message: str, conflict_details?: {...}}
-    Retell tool endpoint.
-    IMPORTANT: user_id is NOT taken from Retell/agent payload; it is always taken from env
-    RETELL_DEFAULT_INBOUND_USER_ID (single-tenant).
-    """
+@router.put("/retell/agent/voice")
+async def retell_put_agent_voice(
+    body: RetellAgentVoiceUpdate,
+    user=Depends(get_current_user),
+    version: int | None = Query(None, ge=0),
+):
+    """Update the configured Retell agent voice_id."""
+    agent_id = (os.getenv("RETELL_AGENT_ID") or "").strip()
+    if not agent_id:
+        raise HTTPException(status_code=500, detail="RETELL_AGENT_ID is not configured")
+    voice_id = (body.voice_id or "").strip()
+    if not voice_id:
+        raise HTTPException(status_code=400, detail="voice_id must be non-empty")
     try:
-        data = await request.json()
-        raw_uid = data.get("user_id")
-        appt_date = data.get("appointment_date") or data.get("date")
-        start = data.get("start_time") or data.get("time")
-        end = data.get("end_time")
-
-        logging.info(
-            "check-availability: raw user_id=%r appointment_date=%r start_time=%r end_time=%r",
-            raw_uid, appt_date, start, end,
-        )
-
-        uid = resolve_agent_tool_user_id(None)
-        if uid is None:
-            logging.error(
-                "check-availability: missing RETELL_DEFAULT_INBOUND_USER_ID. raw_user_id=%r env=%r",
-                raw_uid,
-                os.getenv("RETELL_DEFAULT_INBOUND_USER_ID"),
-            )
-            return JSONResponse(
-                status_code=500,
-                content={"available": True, "message": "Server not configured: missing RETELL_DEFAULT_INBOUND_USER_ID.", "warning": "missing_env_user_id"},
-            )
-
-        if not appt_date or not start:
-            logging.error("check-availability: missing date/time. keys=%s", list(data.keys()))
-            return JSONResponse(status_code=200, content={"available": True, "message": "Missing date or time.", "warning": "missing_fields"})
-
-        # Per product requirement: allow multiple bookings at the same time.
-        # So this tool never blocks a booking due to conflicts.
-        return JSONResponse({"available": True, "message": "Available."})
+        payload = retell_update_agent(agent_id, updates={"voice_id": voice_id}, version=version)
     except Exception as e:
-        logging.error("check-availability error: %s", e)
-        return JSONResponse(
-            status_code=200,
-            content={
-                "available": True,
-                "message": "I couldn't verify availability right now, but you can proceed with booking.",
-                "warning": str(e),
-            },
-        )
+        logging.error("Retell update-agent(voice) failed for agent_id=%s: %s", agent_id, e)
+        raise HTTPException(status_code=502, detail=str(e))
+    return JSONResponse(content=payload)
 
 
-class SendConfirmationRequest(BaseModel):
-    user_id: int | None = None
-    appointment_id: str
-    appointment_date: str
-    start_time: str
-    attendee_name: str
-    organizer_email: str | None = None
-    notes: str | None = None
-
-
-@router.post("/agent/send-confirmation")
-async def agent_send_confirmation(body: SendConfirmationRequest):
+@router.get("/retell/flow/editor")
+async def retell_get_flow_editor(user=Depends(get_current_user), version: int | None = Query(None, ge=0)):
     """
-    Sends a confirmation email. If email isn't available, returns sent=false.
+    Compact editor payload for UI:
+    {conversation_flow_id, version, global_prompt, intro_node_id, intro_text}
     """
+    flow_id = (os.getenv("RETELL_CONVERSATION_FLOW_ID") or "").strip()
+    if not flow_id:
+        raise HTTPException(status_code=500, detail="RETELL_CONVERSATION_FLOW_ID is not configured")
     try:
-        if not body.organizer_email:
-            return JSONResponse({"sent": False, "message": "No email provided"})
+        flow = retell_get_conversation_flow(flow_id, version=version)
+    except Exception as e:
+        logging.error("Retell get-conversation-flow(editor) failed for flow_id=%s: %s", flow_id, e)
+        raise HTTPException(status_code=502, detail=str(e))
 
-        title = "Appointment Confirmation"
-        description = "Appointment booked via inbound call by SUMA."
-        end_time = None
+    intro_id = flow.get("start_node_id")
+    intro_text = None
+    nodes = flow.get("nodes") or []
+    if intro_id and isinstance(nodes, list):
+        for n in nodes:
+            if not isinstance(n, dict):
+                continue
+            if str(n.get("id")) == str(intro_id):
+                instr = n.get("instruction") or {}
+                if isinstance(instr, dict):
+                    intro_text = instr.get("text")
+                break
+
+    return JSONResponse(
+        content=jsonable_encoder(
+            {
+                "conversation_flow_id": flow.get("conversation_flow_id") or flow_id,
+                "version": flow.get("version"),
+                "global_prompt": flow.get("global_prompt"),
+                "intro_node_id": intro_id,
+                "intro_text": intro_text,
+            }
+        )
+    )
+
+
+class RetellFlowPromptAndIntroUpdate(BaseModel):
+    global_prompt: str | None = None
+    intro_node_id: str = "start"
+    intro_text: str | None = None
+
+
+@router.put("/retell/flow/prompt-and-intro")
+async def retell_put_flow_prompt_and_intro(
+    body: RetellFlowPromptAndIntroUpdate,
+    user=Depends(get_current_user),
+    version: int | None = Query(None, ge=0),
+):
+    """
+    Convenience endpoint:
+    - updates conversation_flow.global_prompt
+    - updates a single node's instruction.text (intro node) by node id
+    """
+    flow_id = (os.getenv("RETELL_CONVERSATION_FLOW_ID") or "").strip()
+    if not flow_id:
+        raise HTTPException(status_code=500, detail="RETELL_CONVERSATION_FLOW_ID is not configured")
+
+    updates: dict = {}
+    if body.global_prompt is not None:
+        gp = body.global_prompt.strip()
+        updates["global_prompt"] = gp
+
+    intro_text = body.intro_text.strip() if body.intro_text is not None else None
+    intro_node_id = (body.intro_node_id or "").strip() or "start"
+
+    # Update intro node by fetching the full flow and patching nodes safely.
+    if intro_text is not None:
         try:
-            st = datetime.strptime(body.start_time, "%H:%M")
-            end_time = (st + timedelta(hours=1)).strftime("%H:%M")
-        except Exception:
-            end_time = body.start_time
+            current = retell_get_conversation_flow(flow_id, version=version)
+        except Exception as e:
+            logging.error("Retell get-conversation-flow (for node update) failed for %s: %s", flow_id, e)
+            raise HTTPException(status_code=502, detail=str(e))
+        nodes = current.get("nodes") or []
+        if not isinstance(nodes, list) or not nodes:
+            raise HTTPException(status_code=400, detail="Conversation flow has no nodes to update")
+        found = False
+        new_nodes: list[dict] = []
+        for n in nodes:
+            if not isinstance(n, dict):
+                continue
+            if str(n.get("id")) == intro_node_id:
+                nn = dict(n)
+                instr = nn.get("instruction") or {}
+                if not isinstance(instr, dict):
+                    instr = {}
+                instr2 = dict(instr)
+                instr2["type"] = instr2.get("type") or "prompt"
+                instr2["text"] = intro_text
+                nn["instruction"] = instr2
+                new_nodes.append(nn)
+                found = True
+            else:
+                new_nodes.append(n)
+        if not found:
+            raise HTTPException(status_code=404, detail=f"Intro node '{intro_node_id}' not found in flow")
+        updates["nodes"] = new_nodes
 
-        sent = await mail_obj.send_email_with_calendar_event(
-            attendee_email=body.organizer_email,
-            attendee_name=body.attendee_name,
-            appointment_date=body.appointment_date,
-            start_time=body.start_time,
-            end_time=end_time,
-            title=title,
-            description=description,
-            organizer_name=body.attendee_name,
-            organizer_email=body.organizer_email,
-        )
-        return JSONResponse({"sent": bool(sent), "message": "Confirmation processed"})
+    if not updates:
+        raise HTTPException(status_code=400, detail="No updates provided")
+
+    try:
+        payload = retell_update_conversation_flow(flow_id, updates=updates, version=version)
     except Exception as e:
-        logging.error("send-confirmation error: %s", e)
-        return JSONResponse(
-            status_code=200,
-            content={"sent": False, "message": "Failed to send confirmation", "error": str(e)},
-        )
-
-
-#
-# LiveKit endpoints removed (Retell is the calling provider).
-#
+        logging.error("Retell update-conversation-flow(prompt-and-intro) failed for flow_id=%s: %s", flow_id, e)
+        raise HTTPException(status_code=502, detail=str(e))
+    return JSONResponse(content=payload)
 
 
 # @router.get("/call-history")
@@ -878,41 +968,6 @@ async def get_user_call_history(
 #
 
 
-@router.get("/agent/get-appointments/{user_id}")
-async def get_appointments(user_id: int, from_date: str = None):
-    """API for LiveKit agent to get all appointments for checking conflicts"""
-    try:
-        appointments = db.get_user_appointments(user_id, from_date)
-        
-        return JSONResponse({
-            "success": True,
-            "user_id": user_id,
-            "appointments": [
-                {
-                    "id": apt["id"],
-                    "date": str(apt["appointment_date"]),
-                    "start_time": str(apt["start_time"]),
-                    "end_time": str(apt["end_time"]),
-                    "attendee_email": apt["attendee_email"],
-                    "attendee_name": apt["attendee_name"],
-                    "title": apt["title"],
-                    "description": apt["description"],
-                    "status": apt["status"],
-                    "caller_phone": apt.get("caller_phone"),
-                    "call_id": apt.get("call_id"),
-                }
-                for apt in appointments
-            ]
-        })
-        
-    except Exception as e:
-        logging.error(f"Error fetching appointments: {e}")
-        return JSONResponse(
-            status_code=500,
-            content={"success": False, "error": str(e)}
-        )
-
-
 # @router.post("/agent/check-availability")
 # async def check_availability(request: Request):
 #     """
@@ -944,154 +999,9 @@ async def get_appointments(user_id: int, from_date: str = None):
 #         return error_response(f"Failed to check availability: {str(e)}", status_code=500)
 
 
-@router.post("/agent/book-appointment")
-async def book_appointment(request: Request):
-    """
-    API for LiveKit agent to book an appointment
-    ✅ SIMPLIFIED: No conflict checking - just book immediately
-    """
-    try:
-        data = await request.json()
-
-        # Minimal logging for debugging tool payload issues (do not log transcript text).
-        try:
-            logging.info(
-                "book-appointment: incoming keys=%s raw_user_id=%r",
-                list(data.keys()) if isinstance(data, dict) else None,
-                (data.get("user_id") if isinstance(data, dict) else None),
-            )
-        except Exception:
-            pass
-
-        # Retell tool endpoint.
-        # IMPORTANT: user_id is NOT taken from Retell/agent payload; it is always taken from env
-        # RETELL_DEFAULT_INBOUND_USER_ID (single-tenant).
-        user_id = resolve_agent_tool_user_id(None)
-        # Accept a few common alternate field names (some flows send date/time keys).
-        appointment_date = data.get("appointment_date") or data.get("date") or data.get("reservation_date")
-        start_time = data.get("start_time") or data.get("time") or data.get("appointment_time")
-        end_time = data.get("end_time") or data.get("end")
-        attendee_name = data.get("attendee_name", "Valued Customer")
-        title = data.get("title", "Appointment")
-        description = data.get("description", "")
-        organizer_name = (data.get("organizer_name") or "").strip()
-        organizer_email = data.get("organizer_email")
-
-        logging.info(
-            "book-appointment: resolved user_id=%r appointment_date=%r start_time=%r end_time=%r title=%r attendee_name=%r email_present=%s",
-            user_id,
-            appointment_date,
-            start_time,
-            end_time,
-            title,
-            attendee_name,
-            bool(organizer_email),
-        )
-
-        if user_id is None:
-            logging.error(
-                "book-appointment: missing RETELL_DEFAULT_INBOUND_USER_ID. raw_user_id=%r env=%r",
-                data.get("user_id"),
-                os.getenv("RETELL_DEFAULT_INBOUND_USER_ID"),
-            )
-            return error_response("Server not configured: missing RETELL_DEFAULT_INBOUND_USER_ID.", status_code=500)
-
-        missing: list[str] = []
-        if not appointment_date:
-            missing.append("appointment_date")
-        if not start_time:
-            missing.append("start_time")
-        if missing:
-            logging.error("book-appointment: missing required fields=%s payload_keys=%s", missing, list(data.keys()))
-            return error_response(f"Missing required fields: {', '.join(missing)}", status_code=400)
-
-        # Tool callers sometimes omit organizer_name; default safely for inbound dealership use.
-        if not organizer_name:
-            organizer_name = "Dealership"
-
-        if not end_time:
-            try:
-                # tolerate "HH:MM:SS"
-                st_raw = str(start_time).strip()
-                fmt = "%H:%M:%S" if len(st_raw.split(":")) == 3 else "%H:%M"
-                st = datetime.strptime(st_raw, fmt)
-                end_time = (st + timedelta(hours=1)).strftime("%H:%M")
-            except ValueError:
-                logging.error("book-appointment: invalid start_time=%r payload=%r", start_time, data)
-                return error_response("Invalid start_time; use HH:MM (24-hour)", status_code=400)
-
-        # Validate user exists (prevents FK failures).
-        u = None
-        try:
-            u = db.get_user_by_id(user_id)
-        except Exception:
-            u = None
-        if not u:
-            logging.error("book-appointment: env user not found user_id=%r env_default=%r", user_id, os.getenv("RETELL_DEFAULT_INBOUND_USER_ID"))
-            return error_response("Server misconfigured: env user does not exist.", status_code=500)
-
-        # If caller didn't provide email, fall back to the business user's email.
-        # This prevents production failures (appointments.attendee_email is NOT NULL).
-        attendee_email = organizer_email
-        if not attendee_email:
-            try:
-                attendee_email = (u.get("email") if isinstance(u, dict) else None) or "no-reply@example.com"
-            except Exception:
-                attendee_email = "no-reply@example.com"
-        
-        # ✅ REMOVED: Conflict checking
-        # Just book directly
-
-        raw_phone = (
-            data.get("caller_phone")
-            or data.get("from_number")
-            or data.get("customer_phone")
-            or data.get("phone")
-        )
-        caller_phone = (str(raw_phone).strip() if raw_phone is not None else "") or None
-        raw_cid = data.get("call_id") or data.get("retell_call_id")
-        linked_call_id = (str(raw_cid).strip() if raw_cid is not None else "") or None
-
-        appointment_id = db.create_appointment(
-            user_id=user_id,
-            appointment_date=appointment_date,
-            start_time=start_time,
-            end_time=end_time,
-            attendee_name=attendee_name,
-            attendee_email=attendee_email,
-            title=title,
-            description=description,
-            caller_phone=caller_phone,
-            call_id=linked_call_id,
-        )
-        
-        # Send calendar invite email only if caller email was provided.
-        email_sent = False
-        if organizer_email:
-            email_sent = await mail_obj.send_email_with_calendar_event(
-                attendee_email=organizer_email,
-                attendee_name=organizer_name,
-                appointment_date=appointment_date,
-                start_time=start_time,
-                end_time=end_time,
-                title=title,
-                description=description,
-                organizer_name=organizer_name,
-                organizer_email=organizer_email
-            )
-        
-        logging.info(f"✅ Appointment booked successfully: {appointment_id}")
-        
-        return JSONResponse({
-            "success": True,
-            "appointment_id": str(appointment_id),
-            "email_sent": email_sent,
-        })
-        
-    except Exception as e:
-        logging.error(f"❌ Error booking appointment: {e}")
-        traceback.print_exc()
-        return error_response(f"Failed to book appointment: {str(e)}", status_code=500)
+#
+# /api/agent/* routes removed (LiveKit/legacy tool endpoints).
+#
 
 
 
