@@ -48,6 +48,7 @@ from src.utils.retell_utils import (
     retell_list_voices,
     retell_get_conversation_flow,
     retell_update_conversation_flow,
+    retell_publish_agent,
 )
 
 load_dotenv()
@@ -644,7 +645,6 @@ class RetellAgentVoiceUpdate(BaseModel):
 async def retell_put_agent_voice(
     body: RetellAgentVoiceUpdate,
     user=Depends(get_current_user),
-    version: int | None = Query(None, ge=0),
 ):
     """Update the configured Retell agent voice_id."""
     agent_id = (os.getenv("RETELL_AGENT_ID") or "").strip()
@@ -654,15 +654,17 @@ async def retell_put_agent_voice(
     if not voice_id:
         raise HTTPException(status_code=400, detail="voice_id must be non-empty")
     try:
-        payload = retell_update_agent(agent_id, updates={"voice_id": voice_id}, version=version)
+        payload = retell_update_agent(agent_id, updates={"voice_id": voice_id})
+        # Auto-publish so changes go live immediately
+        retell_publish_agent(agent_id)
     except Exception as e:
-        logging.error("Retell update-agent(voice) failed for agent_id=%s: %s", agent_id, e)
+        logging.error("Retell update/publish agent(voice) failed for agent_id=%s: %s", agent_id, e)
         raise HTTPException(status_code=502, detail=str(e))
-    return JSONResponse(content=payload)
+    return JSONResponse(content=jsonable_encoder({"ok": True, "voice_id": voice_id}))
 
 
 @router.get("/retell/flow/editor")
-async def retell_get_flow_editor(user=Depends(get_current_user), version: int | None = Query(None, ge=0)):
+async def retell_get_flow_editor(user=Depends(get_current_user)):
     """
     Compact editor payload for UI:
     {conversation_flow_id, version, global_prompt, intro_node_id, intro_text}
@@ -671,7 +673,7 @@ async def retell_get_flow_editor(user=Depends(get_current_user), version: int | 
     if not flow_id:
         raise HTTPException(status_code=500, detail="RETELL_CONVERSATION_FLOW_ID is not configured")
     try:
-        flow = retell_get_conversation_flow(flow_id, version=version)
+        flow = retell_get_conversation_flow(flow_id)
     except Exception as e:
         logging.error("Retell get-conversation-flow(editor) failed for flow_id=%s: %s", flow_id, e)
         raise HTTPException(status_code=502, detail=str(e))
@@ -712,7 +714,6 @@ class RetellFlowPromptAndIntroUpdate(BaseModel):
 async def retell_put_flow_prompt_and_intro(
     body: RetellFlowPromptAndIntroUpdate,
     user=Depends(get_current_user),
-    version: int | None = Query(None, ge=0),
 ):
     """
     Convenience endpoint:
@@ -734,7 +735,7 @@ async def retell_put_flow_prompt_and_intro(
     # Update intro node by fetching the full flow and patching nodes safely.
     if intro_text is not None:
         try:
-            current = retell_get_conversation_flow(flow_id, version=version)
+            current = retell_get_conversation_flow(flow_id)
         except Exception as e:
             logging.error("Retell get-conversation-flow (for node update) failed for %s: %s", flow_id, e)
             raise HTTPException(status_code=502, detail=str(e))
@@ -767,7 +768,7 @@ async def retell_put_flow_prompt_and_intro(
         raise HTTPException(status_code=400, detail="No updates provided")
 
     try:
-        payload = retell_update_conversation_flow(flow_id, updates=updates, version=version)
+        payload = retell_update_conversation_flow(flow_id, updates=updates)
     except Exception as e:
         logging.error("Retell update-conversation-flow(prompt-and-intro) failed for flow_id=%s: %s", flow_id, e)
         raise HTTPException(status_code=502, detail=str(e))

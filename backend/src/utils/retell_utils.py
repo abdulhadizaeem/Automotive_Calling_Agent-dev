@@ -666,3 +666,22 @@ def retell_update_conversation_flow(
     if not isinstance(data, dict):
         raise RuntimeError("Unexpected Retell update-conversation-flow response")
     return data
+
+
+def retell_publish_agent(agent_id: str) -> None:
+    """Publish the latest agent version in Retell (voice/settings changes)."""
+    import requests
+
+    api_key = (os.getenv("RETELL_API_KEY") or "").strip()
+    if not api_key:
+        raise RuntimeError("RETELL_API_KEY is not configured")
+    aid = (agent_id or "").strip()
+    if not aid:
+        raise RuntimeError("agent_id is required")
+    url = f"https://api.retellai.com/publish-agent/{aid}"
+    r = requests.post(
+        url,
+        headers={"Authorization": f"Bearer {api_key}"},
+        timeout=45,
+    )
+    r.raise_for_status()
